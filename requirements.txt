@@ -1,0 +1,8 @@
+streamlit
+yfinance>=0.2.50
+pandas
+numpy
+matplotlib
+PyGithub
+requests
+streamlit-authenticator>=0.3.0
