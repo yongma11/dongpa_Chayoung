@@ -1,8 +1,9 @@
-streamlit
-yfinance>=0.2.50
-pandas
-numpy
-matplotlib
-PyGithub
-requests
-streamlit-authenticator>=0.3.0
+streamlit>=1.30
+PyGithub>=2.1
+matplotlib>=3.7
+pandas>=2.0
+numpy>=1.24
+yfinance>=0.2.40
+gspread>=5.12
+google-auth>=2.20
+requests>=2.31
