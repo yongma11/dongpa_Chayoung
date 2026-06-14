@@ -25,7 +25,8 @@ DEFAULT = dict(
     init_cash     = 10000.0,
     # 공격모드
     atk_tiers        = 5,
-    atk_max_active    = 4,     # ★ 동시 최대 보유 티어 수 (MDD 제어 핵심)
+    atk_max_active    = 5,     # 동시 최대 보유 티어 수 (5=전체 허용)
+    atk_stop_loss     = -17.0, # ★ 공격 포지션 손절 임계값(%) — MDD 40% 이하 핵심 장치
     atk_buy_pct   = 0.5,    # FI+ 시 매수조건 (전일 종가 대비 %)
     atk_fi_neg    = -0.1,   # FI- 시 매수조건 (고정)
     atk_hold_nmin = 7,      # 보유기간 최소(일)
@@ -136,7 +137,8 @@ def run_backtest(df, p):
     """
     init_cash      = p['init_cash']
     atk_tiers      = p['atk_tiers']
-    atk_max_active = p.get('atk_max_active', atk_tiers)  # ★ 동시 최대 보유 티어
+    atk_max_active = p.get('atk_max_active', atk_tiers)  # 동시 최대 보유 티어
+    atk_stop_loss  = p.get('atk_stop_loss', None)        # ★ 손절 임계값 (예: -17.0 → -17%)
     def_tiers      = p['def_tiers']
     def_weights    = [w / 100 for w in p['def_weights']]
 
@@ -190,6 +192,17 @@ def run_backtest(df, p):
                 s = atk_slots[ti]
                 if s is None:
                     continue
+                # ★ 손절: 매수가 대비 atk_stop_loss% 이하 하락 시 즉시 청산
+                if atk_stop_loss is not None:
+                    loss_pct = (close / s['buy_price'] - 1) * 100
+                    if loss_pct <= atk_stop_loss:
+                        pnl = (close - s['buy_price']) * s['shares']
+                        cash += s['shares'] * close
+                        sells_today.append({'tier': f'공T{ti+1}', 'shares': s['shares'],
+                                            'pnl': pnl, 'reason': f'손절{atk_stop_loss:.0f}%',
+                                            'sell_cond': close, 'sell_pct': loss_pct})
+                        atk_slots[ti] = None
+                        continue
                 if s['mode'] != '공격':
                     pnl = (close - s['buy_price']) * s['shares']
                     cash += s['shares'] * close
@@ -471,9 +484,15 @@ with st.sidebar:
     with st.expander("⚔️ 공격모드 파라미터"):
         col1, col2  = st.columns(2)
         atk_tiers      = col1.number_input("분할수", value=DEFAULT['atk_tiers'], min_value=1, max_value=10)
-        atk_max_active = col2.number_input("최대 동시 보유 티어 ★",
+        atk_max_active = col2.number_input("최대 동시 보유 티어",
                                             value=DEFAULT['atk_max_active'], min_value=1, max_value=10,
-                                            help="MDD 제어 핵심 파라미터. 분할수 이하로 설정하면 동시 보유 포지션을 제한해 폭락 시 손실을 줄임")
+                                            help="동시 보유 가능한 최대 티어 수. 분할수보다 낮게 설정하면 동시 노출을 제한.")
+        col1, col2  = st.columns(2)
+        use_stop_loss = col1.checkbox("공격 손절 ★", value=True,
+                                       help="공격 포지션이 매수가 대비 설정값 이하로 하락하면 즉시 청산. MDD 40% 이하 핵심 장치.")
+        atk_stop_loss_val = col2.number_input("손절 임계값(%)",
+                                               value=DEFAULT['atk_stop_loss'], step=1.0, max_value=-1.0,
+                                               help="예: -17이면 매수가 대비 17% 이상 하락 시 즉시 손절. 백테스트 검증값: -17%")
         col1, col2  = st.columns(2)
         atk_buy_pct = col1.number_input("매수조건 FI+(%, 전일종가 대비)", value=DEFAULT['atk_buy_pct'])
         atk_fi_neg  = col2.number_input("매수조건 FI-(%, 고정)", value=DEFAULT['atk_fi_neg'])
@@ -525,6 +544,7 @@ if run_btn:
         init_cash      = float(init_cash),
         atk_tiers      = int(atk_tiers),
         atk_max_active = int(atk_max_active),
+        atk_stop_loss  = float(atk_stop_loss_val) if use_stop_loss else None,
         atk_buy_pct   = float(atk_buy_pct),
         atk_fi_neg    = float(atk_fi_neg),
         atk_hold_nmin = int(atk_hold_nmin),
