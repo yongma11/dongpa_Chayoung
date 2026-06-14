@@ -24,7 +24,8 @@ DEFAULT = dict(
     ticker        = "SOXL",
     init_cash     = 10000.0,
     # 공격모드
-    atk_tiers     = 5,
+    atk_tiers        = 5,
+    atk_max_active    = 4,     # ★ 동시 최대 보유 티어 수 (MDD 제어 핵심)
     atk_buy_pct   = 0.5,    # FI+ 시 매수조건 (전일 종가 대비 %)
     atk_fi_neg    = -0.1,   # FI- 시 매수조건 (고정)
     atk_hold_nmin = 7,      # 보유기간 최소(일)
@@ -38,12 +39,12 @@ DEFAULT = dict(
     def_tiers     = 5,
     def_hold      = 8,      # 보유기간(일, 고정)
     def_buy_ma    = -0.6,   # MA 대비 매수조건(%)
-    def_buy_prev  = -5.5,   # 전일 종가 대비 매수조건(%)
+    def_buy_prev  = -2.0,   # ★ 전일 종가 대비 매수조건(%) — 완화(-5.5→-2.0)
     def_sell_pct  = 0.7,    # MA 대비 매도조건(%)
     def_ma_period = 3,      # MA 기준
     def_weights   = [6,13,20,27,34],  # 티어별 비중(%)
     # 모드 전환
-    mode_rsi_up   = 55.0,   # wRSI 상향 돌파 시 공격모드
+    mode_rsi_up   = 60.0,   # ★ wRSI 상향 돌파 시 공격모드 (55→60, 과잉공격 억제)
     mode_rsi_dn   = 50.0,   # wRSI 하향 돌파 시 방어모드
     rsi_period    = 14,
 )
@@ -133,10 +134,11 @@ def run_backtest(df, p):
     p : 파라미터 dict
     반환: asset_df, log_df (1일 1행, 30컬럼)
     """
-    init_cash   = p['init_cash']
-    atk_tiers   = p['atk_tiers']
-    def_tiers   = p['def_tiers']
-    def_weights = [w / 100 for w in p['def_weights']]
+    init_cash      = p['init_cash']
+    atk_tiers      = p['atk_tiers']
+    atk_max_active = p.get('atk_max_active', atk_tiers)  # ★ 동시 최대 보유 티어
+    def_tiers      = p['def_tiers']
+    def_weights    = [w / 100 for w in p['def_weights']]
 
     dates  = df.index.tolist()
     n_days = len(dates)
@@ -249,9 +251,10 @@ def run_backtest(df, p):
             buy_cond_pct  = p['atk_fi_neg'] if not fi_p else p['atk_buy_pct']
             buy_trigger_price = prev_close * (1 + buy_cond_pct / 100)
             next_empty = next((ti for ti in range(atk_tiers) if atk_slots[ti] is None), None)
+            active_atk = sum(1 for s in atk_slots if s is not None)  # ★ 현재 보유 티어 수
             if next_empty is not None:
                 buy_alloc_shown = total_after_sell / atk_tiers
-                if close <= buy_trigger_price:
+                if close <= buy_trigger_price and active_atk < atk_max_active:  # ★ 최대 티어 제한
                     alloc = min(total_after_sell / atk_tiers, cash)
                     if alloc >= 1:
                         shares = alloc / close
@@ -466,7 +469,11 @@ with st.sidebar:
                                     help="wRSI가 이 값 아래로 내려가면 방어모드 전환")
 
     with st.expander("⚔️ 공격모드 파라미터"):
-        atk_tiers   = st.number_input("분할수", value=DEFAULT['atk_tiers'], min_value=1, max_value=10)
+        col1, col2  = st.columns(2)
+        atk_tiers      = col1.number_input("분할수", value=DEFAULT['atk_tiers'], min_value=1, max_value=10)
+        atk_max_active = col2.number_input("최대 동시 보유 티어 ★",
+                                            value=DEFAULT['atk_max_active'], min_value=1, max_value=10,
+                                            help="MDD 제어 핵심 파라미터. 분할수 이하로 설정하면 동시 보유 포지션을 제한해 폭락 시 손실을 줄임")
         col1, col2  = st.columns(2)
         atk_buy_pct = col1.number_input("매수조건 FI+(%, 전일종가 대비)", value=DEFAULT['atk_buy_pct'])
         atk_fi_neg  = col2.number_input("매수조건 FI-(%, 고정)", value=DEFAULT['atk_fi_neg'])
@@ -492,7 +499,8 @@ with st.sidebar:
         def_hold    = st.number_input("보유기간(일)", value=DEFAULT['def_hold'])
         col1, col2  = st.columns(2)
         def_buy_ma  = col1.number_input("매수조건 MA(%)", value=DEFAULT['def_buy_ma'])
-        def_buy_prev= col2.number_input("매수조건 전일(%)", value=DEFAULT['def_buy_prev'])
+        def_buy_prev= col2.number_input("매수조건 전일(%) ★", value=DEFAULT['def_buy_prev'],
+                                         help="전일 종가 대비 매수 트리거. -2.0%는 전일보다 2% 하락 시 매수 (원본 역산값: ~-2.8%)")
         col1, col2  = st.columns(2)
         def_sell_pct= col1.number_input("매도조건 MA(%)", value=DEFAULT['def_sell_pct'])
         def_ma_period= col2.number_input("MA 기준(일)", value=DEFAULT['def_ma_period'])
@@ -514,8 +522,9 @@ if run_btn:
         def_w = DEFAULT['def_weights']
 
     params = dict(
-        init_cash     = float(init_cash),
-        atk_tiers     = int(atk_tiers),
+        init_cash      = float(init_cash),
+        atk_tiers      = int(atk_tiers),
+        atk_max_active = int(atk_max_active),
         atk_buy_pct   = float(atk_buy_pct),
         atk_fi_neg    = float(atk_fi_neg),
         atk_hold_nmin = int(atk_hold_nmin),
