@@ -45,8 +45,12 @@ DEFAULT = dict(
     def_ma_period = 3,      # MA 기준
     def_weights   = [6,13,20,27,34],  # 티어별 비중(%)
     # 모드 전환
-    mode_rsi_up   = 60.0,   # ★ wRSI 상향 돌파 시 공격모드 (55→60, 과잉공격 억제)
-    mode_rsi_dn   = 50.0,   # wRSI 하향 돌파 시 방어모드
+    mode_type     = '동파+RSI', # 모드 전환 방식: 'wRSI' / '동파_MA' / '동파+RSI'
+    mode_rsi_up   = 60.0,   # wRSI 기준: 공격 진입 (wRSI 방식, 또는 동파+RSI 필터)
+    mode_rsi_dn   = 50.0,   # wRSI 기준: 방어 복귀
+    dp_fast_ma    = 20,     # 동파법: 단기 MA 기간 (기본 20일)
+    dp_slow_ma    = 60,     # 동파법: 장기 MA 기간 (기본 60일)
+    dp_wrsi_filt  = 55.0,   # 동파+RSI: wRSI 필터 기준값 (기본 55)
     rsi_period    = 14,
 )
 
@@ -63,8 +67,18 @@ def calc_rsi(series, period=14):
 def calc_ma(series, period):
     return series.rolling(period).mean()
 
-def load_data(ticker, start, end, rsi_period=14, mode_up=55, mode_dn=50):
-    """yfinance 데이터 로드 + 지표 계산"""
+def load_data(ticker, start, end, rsi_period=14,
+              mode_type='wRSI',
+              mode_up=60.0, mode_dn=50.0,
+              dp_fast_ma=20, dp_slow_ma=60,
+              dp_wrsi_filter=55.0):
+    """
+    yfinance 데이터 로드 + 지표 계산
+    mode_type:
+      'wRSI'    — 기존: 주봉 RSI 기반 히스테레시스
+      '동파_MA'  — 동파법: 일봉 fast_MA > slow_MA (단순)
+      '동파+RSI' — 동파법 AND wRSI 필터 조합 (최적: Calmar 1.94)
+    """
     raw = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
     if raw.empty:
         return None
@@ -81,31 +95,68 @@ def load_data(ticker, start, end, rsi_period=14, mode_up=55, mode_dn=50):
     df['RSI'] = calc_rsi(df['Close'], rsi_period)
 
     # Force Index (부호만: + or -)
-    df['FI_pos'] = (df['Close'] >= df['Close'].shift(1))   # True=양수, False=음수
+    df['FI_pos'] = (df['Close'] >= df['Close'].shift(1))
 
-    # MA(3), MA(5)
+    # MA(3), MA(5) — 방어모드 매매에 사용
     df['MA3'] = calc_ma(df['Close'], 3)
     df['MA5'] = calc_ma(df['Close'], 5)
 
-    # 주봉 RSI (weekly resample → RSI)
+    # 동파법용 MA
+    df[f'MA{dp_fast_ma}'] = calc_ma(df['Close'], dp_fast_ma)
+    df[f'MA{dp_slow_ma}'] = calc_ma(df['Close'], dp_slow_ma)
+
+    # 주봉 RSI (wRSI)
     weekly = df['Close'].resample('W-FRI').last().dropna()
     wrsi   = calc_rsi(weekly, rsi_period).rename('wRSI')
     df     = df.join(wrsi.resample('D').last().ffill(), how='left')
 
-    # 모드 전환 (wRSI 기반 히스테레시스)
+    # ── 모드 전환 ──
     mode = []
     cur  = '방어'
-    for w in df['wRSI']:
-        if pd.isna(w):
-            mode.append(cur)
-            continue
-        if cur == '방어' and w >= mode_up:
-            cur = '공격'
-        elif cur == '공격' and w < mode_dn:
-            cur = '방어'
-        mode.append(cur)
-    df['Mode'] = mode
 
+    if mode_type == 'wRSI':
+        # 기존: 주봉 RSI 히스테레시스
+        for w in df['wRSI']:
+            if pd.isna(w):
+                mode.append(cur); continue
+            if cur == '방어' and w >= mode_up:
+                cur = '공격'
+            elif cur == '공격' and w < mode_dn:
+                cur = '방어'
+            mode.append(cur)
+
+    elif mode_type == '동파_MA':
+        # 동파법: fast MA > slow MA → 공격, 이탈 → 방어
+        fast = df[f'MA{dp_fast_ma}'].values
+        slow = df[f'MA{dp_slow_ma}'].values
+        for f_v, s_v in zip(fast, slow):
+            if pd.isna(f_v) or pd.isna(s_v):
+                mode.append(cur); continue
+            if cur == '방어' and f_v > s_v:
+                cur = '공격'
+            elif cur == '공격' and f_v <= s_v:
+                cur = '방어'
+            mode.append(cur)
+
+    elif mode_type == '동파+RSI':
+        # 동파법 AND wRSI 필터 조합 (백테스트 최적: MA20>MA60 AND wRSI>55)
+        fast  = df[f'MA{dp_fast_ma}'].values
+        slow  = df[f'MA{dp_slow_ma}'].values
+        wrsi_v = df['wRSI'].values
+        for f_v, s_v, w in zip(fast, slow, wrsi_v):
+            if pd.isna(f_v) or pd.isna(s_v):
+                mode.append(cur); continue
+            dp_bull = (f_v > s_v)
+            rsi_ok  = (not pd.isna(w)) and (w >= dp_wrsi_filter)
+            # 공격 진입: 동파 AND wRSI 조건 동시 충족
+            if cur == '방어' and dp_bull and rsi_ok:
+                cur = '공격'
+            # 방어 복귀: 동파 이탈 OR wRSI 기준 미달
+            elif cur == '공격' and (not dp_bull or (not pd.isna(w) and w < mode_dn)):
+                cur = '방어'
+            mode.append(cur)
+
+    df['Mode'] = mode
     return df
 
 
@@ -473,13 +524,44 @@ with st.sidebar:
         end_date   = col2.date_input("종료일", datetime.today())
         init_cash  = st.number_input("초기 자금($)", value=DEFAULT['init_cash'], step=1000.0)
 
-    with st.expander("🗂 모드 설정"):
-        st.caption("주봉 RSI(wRSI) 기반 자동 모드 전환")
-        col1, col2 = st.columns(2)
-        mode_up = col1.number_input("공격 진입(wRSI↑)", value=DEFAULT['mode_rsi_up'], step=1.0,
-                                    help="wRSI가 이 값 이상 올라오면 공격모드 전환")
-        mode_dn = col2.number_input("방어 진입(wRSI↓)", value=DEFAULT['mode_rsi_dn'], step=1.0,
-                                    help="wRSI가 이 값 아래로 내려가면 방어모드 전환")
+    with st.expander("🗂 모드 전환 설정"):
+        mode_type = st.radio(
+            "모드 전환 방식",
+            options=['wRSI', '동파_MA', '동파+RSI'],
+            index=['wRSI','동파_MA','동파+RSI'].index(DEFAULT['mode_type']),
+            horizontal=True,
+            help="wRSI: 주봉 RSI 히스테레시스 / 동파_MA: 이동평균 크로스 / 동파+RSI: MA크로스 AND wRSI 필터(★백테스트 최적)"
+        )
+
+        if mode_type == 'wRSI':
+            st.caption("주봉 RSI(wRSI) 기반 히스테레시스")
+            col1, col2 = st.columns(2)
+            mode_up      = col1.number_input("공격 진입(wRSI↑)", value=DEFAULT['mode_rsi_up'], step=1.0)
+            mode_dn      = col2.number_input("방어 복귀(wRSI↓)", value=DEFAULT['mode_rsi_dn'], step=1.0)
+            dp_fast_ma   = DEFAULT['dp_fast_ma']
+            dp_slow_ma   = DEFAULT['dp_slow_ma']
+            dp_wrsi_filt = DEFAULT['dp_wrsi_filt']
+
+        elif mode_type == '동파_MA':
+            st.caption("단기MA > 장기MA → 공격 / 이탈 → 방어")
+            col1, col2 = st.columns(2)
+            dp_fast_ma   = col1.number_input("단기 MA(일)", value=DEFAULT['dp_fast_ma'], min_value=2, max_value=100)
+            dp_slow_ma   = col2.number_input("장기 MA(일)", value=DEFAULT['dp_slow_ma'], min_value=5, max_value=300)
+            mode_up      = DEFAULT['mode_rsi_up']
+            mode_dn      = DEFAULT['mode_rsi_dn']
+            dp_wrsi_filt = DEFAULT['dp_wrsi_filt']
+
+        else:  # 동파+RSI
+            st.caption("단기MA > 장기MA AND wRSI ≥ 필터 → 공격 (백테스트 최적: Calmar 1.94)")
+            col1, col2 = st.columns(2)
+            dp_fast_ma   = col1.number_input("단기 MA(일)", value=DEFAULT['dp_fast_ma'], min_value=2, max_value=100)
+            dp_slow_ma   = col2.number_input("장기 MA(일)", value=DEFAULT['dp_slow_ma'], min_value=5, max_value=300)
+            col1, col2 = st.columns(2)
+            dp_wrsi_filt = col1.number_input("wRSI 진입 필터 ★", value=DEFAULT['dp_wrsi_filt'], step=1.0,
+                                              help="동파 조건 + wRSI이 이 값 이상일 때만 공격모드 진입")
+            mode_dn      = col2.number_input("방어 복귀(wRSI↓)", value=DEFAULT['mode_rsi_dn'], step=1.0,
+                                              help="wRSI가 이 값 아래로 내려가면 방어모드")
+            mode_up      = DEFAULT['mode_rsi_up']
 
     with st.expander("⚔️ 공격모드 파라미터"):
         col1, col2  = st.columns(2)
@@ -564,8 +646,15 @@ if run_btn:
     )
 
     with st.spinner("yfinance 데이터 로드 중..."):
-        df_data = load_data(ticker, str(start_date), str(end_date),
-                            mode_up=float(mode_up), mode_dn=float(mode_dn))
+        df_data = load_data(
+            ticker, str(start_date), str(end_date),
+            mode_type    = mode_type,
+            mode_up      = float(mode_up),
+            mode_dn      = float(mode_dn),
+            dp_fast_ma   = int(dp_fast_ma),
+            dp_slow_ma   = int(dp_slow_ma),
+            dp_wrsi_filter = float(dp_wrsi_filt),
+        )
 
     if df_data is None or df_data.empty:
         st.error("데이터를 불러올 수 없습니다. 티커나 날짜를 확인하세요.")
