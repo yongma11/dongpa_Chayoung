@@ -129,196 +129,271 @@ def calc_sell_pct(rsi, sell_min, sell_max, alpha):
 # ─────────────────────────────────────────────
 def run_backtest(df, p):
     """
-    df: Close, RSI, FI_pos, MA3, MA5, Mode 컬럼 포함
+    df: Close, RSI, FI_pos, MA3, MA5, wRSI, Mode 컬럼 포함
     p : 파라미터 dict
+    반환: asset_df, log_df (1일 1행, 30컬럼)
     """
-    init_cash    = p['init_cash']
-    atk_tiers    = p['atk_tiers']
-    def_tiers    = p['def_tiers']
-    def_weights  = [w/100 for w in p['def_weights']]
-    # 방어 티어 누적 비중 (할당 계산용)
-    def_cum      = [sum(def_weights[:i+1]) for i in range(def_tiers)]
+    init_cash   = p['init_cash']
+    atk_tiers   = p['atk_tiers']
+    def_tiers   = p['def_tiers']
+    def_weights = [w / 100 for w in p['def_weights']]
 
-    dates  = df.index
+    dates  = df.index.tolist()
+    n_days = len(dates)
     closes = df['Close'].values
     rsis   = df['RSI'].values
-    fi_pos = df['FI_pos'].values    # True=FI양수, False=FI음수(매수 신호)
+    fi_pos = df['FI_pos'].values
     ma3    = df['MA3'].values
     ma5    = df['MA5'].values
+    wrsi_v = df['wRSI'].values if 'wRSI' in df.columns else np.full(n_days, np.nan)
     modes  = df['Mode'].values
 
-    cash   = init_cash
-    log    = []
+    cash       = init_cash
+    daily_log  = []
+    asset_recs = []
 
-    # 슬롯: {'buy_date_idx','buy_price','sell_target','hold_until_idx','shares','tier','mode','rsi','hold_days'}
     atk_slots = [None] * atk_tiers
     def_slots = [None] * def_tiers
 
-    # 방어 티어별 다음 빈 슬롯 인덱스 추적
-    def_next_tier = 0   # 다음에 채울 티어 번호 (0-based)
-    atk_next_tier = 0
-
-    total_assets_arr = []
+    peak_asset = init_cash
+    prev_total = init_cash
 
     for i, date in enumerate(dates):
-        close = closes[i]
-        rsi   = rsis[i]
-        mode  = modes[i]
-        fi_p  = fi_pos[i]
-        _ma3  = ma3[i]
-        _ma5  = ma5[i]
-        prev_close = closes[i-1] if i > 0 else close
-        prev2_close = closes[i-2] if i > 1 else prev_close
+        close  = float(closes[i])
+        rsi    = float(rsis[i])
+        mode   = modes[i]
+        fi_p   = bool(fi_pos[i])
+        _ma3   = float(ma3[i])
+        _ma5   = float(ma5[i])
+        _wrsi  = float(wrsi_v[i]) if not np.isnan(wrsi_v[i]) else None
+        prev_close  = float(closes[i-1]) if i > 0 else close
+        prev2_close = float(closes[i-2]) if i > 1 else prev_close
 
-        # ── 오늘 MOC 주문 처리 전, 평가 ──
-        holdings_val = 0.0
-        for s in atk_slots + def_slots:
-            if s is not None:
-                holdings_val += s['shares'] * close
+        daily_ret = (close / prev_close - 1) * 100 if i > 0 else 0.0
+        fi_str    = '=+' if fi_p else '-'
+
+        # ─── 방어 MA 매도 트리거 (항상 계산) ───
+        factor = 1 + p['def_sell_pct'] / 100
+        if not (np.isnan(prev_close) or np.isnan(prev2_close)):
+            def_sell_trig = factor * (prev_close + prev2_close) / (p['def_ma_period'] - factor)
+        else:
+            def_sell_trig = np.nan
 
         # ─── 매도 처리 ───
-        sold_tiers_today = set()   # MOC 매도된 티어
+        sells_today = []   # {tier, shares, buy_price, sell_price, pnl, reason, sell_cond, sell_pct}
 
-        # 공격모드 슬롯 매도 체크
+        # 공격 슬롯
         if mode == '공격':
             for ti in range(atk_tiers):
                 s = atk_slots[ti]
                 if s is None:
                     continue
                 if s['mode'] != '공격':
-                    # 모드 전환으로 남은 포지션 → 즉시 청산
+                    pnl = (close - s['buy_price']) * s['shares']
                     cash += s['shares'] * close
-                    log.append({'날짜': date, 'Action': '🔄모드청산', '티어': f'공T{ti+1}',
-                                '종가': close, '수량': s['shares'], '손익': (close-s['buy_price'])*s['shares'],
-                                '사유': '모드전환', 'Cash': cash, 'Holdings': holdings_val})
+                    sells_today.append({'tier': f'공T{ti+1}', 'shares': s['shares'],
+                                        'pnl': pnl, 'reason': '모드청산',
+                                        'sell_cond': close, 'sell_pct': 0})
                     atk_slots[ti] = None
                     continue
-                # 보유기간 만료 (MOC)
                 if i >= s['hold_until_idx']:
-                    pnl  = (close - s['buy_price']) * s['shares']
+                    pnl = (close - s['buy_price']) * s['shares']
                     cash += s['shares'] * close
-                    log.append({'날짜': date, 'Action': '🔴매도(공)', '티어': f'공T{ti+1}',
-                                '종가': close, '수량': s['shares'], '손익': pnl,
-                                '사유': 'MOC', 'Cash': cash, 'Holdings': 0})
+                    sells_today.append({'tier': f'공T{ti+1}', 'shares': s['shares'],
+                                        'pnl': pnl, 'reason': 'MOC',
+                                        'sell_cond': close, 'sell_pct': s.get('sell_pct', 0)})
                     atk_slots[ti] = None
-                    sold_tiers_today.add(('공', ti))
                     continue
-                # 수익 목표 달성
                 if close >= s['sell_target']:
-                    # MA5 보류 조건: 전일 종가 > 전일 MA5 이면 T1만 보류
                     if ti == 0 and i > 0 and closes[i-1] > (ma5[i-1] if not np.isnan(ma5[i-1]) else 0):
-                        pass   # 보류
+                        pass  # MA5 보류
                     else:
-                        pnl  = (close - s['buy_price']) * s['shares']
+                        pnl = (close - s['buy_price']) * s['shares']
                         cash += s['shares'] * close
-                        log.append({'날짜': date, 'Action': '🔴매도(공)', '티어': f'공T{ti+1}',
-                                    '종가': close, '수량': s['shares'], '손익': pnl,
-                                    '사유': f'수익({s["sell_pct"]:.2f}%)', 'Cash': cash, 'Holdings': 0})
+                        sells_today.append({'tier': f'공T{ti+1}', 'shares': s['shares'],
+                                            'pnl': pnl, 'reason': f'{s.get("sell_pct",0):.2f}%',
+                                            'sell_cond': s['sell_target'],
+                                            'sell_pct': s.get('sell_pct', 0)})
                         atk_slots[ti] = None
-                        sold_tiers_today.add(('공', ti))
 
-        # 방어모드 슬롯 매도 체크
+        # 방어 슬롯 (모드 무관)
         for ti in range(def_tiers):
             s = def_slots[ti]
             if s is None:
                 continue
-            # 모드가 방어→공격 전환되었어도 방어 포지션은 유지 (별도 풀)
-            # 보유기간 만료 (MOC)
             if i >= s['hold_until_idx']:
-                pnl  = (close - s['buy_price']) * s['shares']
+                pnl = (close - s['buy_price']) * s['shares']
                 cash += s['shares'] * close
-                log.append({'날짜': date, 'Action': '🔴매도(방)', '티어': f'방T{ti+1}',
-                            '종가': close, '수량': s['shares'], '손익': pnl,
-                            '사유': 'MOC', 'Cash': cash, 'Holdings': 0})
+                sells_today.append({'tier': f'방T{ti+1}', 'shares': s['shares'],
+                                    'pnl': pnl, 'reason': 'MOC',
+                                    'sell_cond': close, 'sell_pct': 0})
                 def_slots[ti] = None
-                sold_tiers_today.add(('방', ti))
                 continue
-            # MA 매도 조건
-            factor = 1 + p['def_sell_pct'] / 100
-            if not (np.isnan(prev_close) or np.isnan(prev2_close)):
-                sell_trigger = factor * (prev_close + prev2_close) / (p['def_ma_period'] - factor)
-                if close >= sell_trigger:
-                    pnl  = (close - s['buy_price']) * s['shares']
-                    cash += s['shares'] * close
-                    log.append({'날짜': date, 'Action': '🔴매도(방)', '티어': f'방T{ti+1}',
-                                '종가': close, '수량': s['shares'], '손익': pnl,
-                                '사유': 'MA', 'Cash': cash, 'Holdings': 0})
-                    def_slots[ti] = None
-                    sold_tiers_today.add(('방', ti))
+            if not np.isnan(def_sell_trig) and close >= def_sell_trig:
+                pnl = (close - s['buy_price']) * s['shares']
+                cash += s['shares'] * close
+                sells_today.append({'tier': f'방T{ti+1}', 'shares': s['shares'],
+                                    'pnl': pnl, 'reason': 'MA',
+                                    'sell_cond': def_sell_trig, 'sell_pct': 0})
+                def_slots[ti] = None
 
         # ─── 매수 처리 ───
-        holdings_val = sum(s['shares']*close for s in atk_slots+def_slots if s is not None)
+        hv_after_sell  = sum(s['shares'] * close for s in atk_slots + def_slots if s is not None)
+        total_after_sell = cash + hv_after_sell
+
+        buy_today         = None
+        buy_trigger_price = None
+        buy_alloc_shown   = None
 
         if mode == '공격':
-            # FI 음수(하락)일 때 다음 빈 티어 채우기
-            buy_cond_pct = p['atk_fi_neg'] if not fi_p else p['atk_buy_pct']
-            buy_trigger  = prev_close * (1 + buy_cond_pct / 100)
-            if close <= buy_trigger:
-                # 비어 있는 첫 티어 찾기
-                for ti in range(atk_tiers):
-                    if atk_slots[ti] is None:
-                        total_val   = cash + holdings_val
-                        alloc       = total_val / atk_tiers
-                        if alloc < 1 or cash < alloc:
-                            alloc = cash
-                        if alloc < 1:
-                            break
-                        shares      = alloc / close
-                        hold_days   = calc_hold_days(rsi, p['atk_hold_nmin'], p['atk_hold_nmax'], p['atk_hold_a'])
-                        sell_pct    = calc_sell_pct(rsi, p['atk_sell_min'], p['atk_sell_max'], p['atk_sell_a'])
-                        sell_target = close * (1 + sell_pct / 100)
-                        hold_until  = i + hold_days   # 인덱스 기준
-                        cash       -= alloc
-                        atk_slots[ti] = {
-                            'buy_price': close, 'sell_target': sell_target,
-                            'hold_until_idx': hold_until, 'shares': shares,
-                            'mode': '공격', 'rsi': rsi, 'hold_days': hold_days,
-                            'sell_pct': sell_pct,
+            buy_cond_pct  = p['atk_fi_neg'] if not fi_p else p['atk_buy_pct']
+            buy_trigger_price = prev_close * (1 + buy_cond_pct / 100)
+            next_empty = next((ti for ti in range(atk_tiers) if atk_slots[ti] is None), None)
+            if next_empty is not None:
+                buy_alloc_shown = total_after_sell / atk_tiers
+                if close <= buy_trigger_price:
+                    alloc = min(total_after_sell / atk_tiers, cash)
+                    if alloc >= 1:
+                        shares = alloc / close
+                        hold_d = calc_hold_days(rsi, p['atk_hold_nmin'], p['atk_hold_nmax'], p['atk_hold_a'])
+                        sell_p = calc_sell_pct(rsi, p['atk_sell_min'], p['atk_sell_max'], p['atk_sell_a'])
+                        sell_t = close * (1 + sell_p / 100)
+                        cash  -= alloc
+                        atk_slots[next_empty] = {
+                            'buy_price': close, 'sell_target': sell_t,
+                            'hold_until_idx': i + hold_d, 'shares': shares,
+                            'mode': '공격', 'rsi': rsi, 'hold_days': hold_d, 'sell_pct': sell_p,
                         }
-                        log.append({'날짜': date, 'Action': '🟢매수(공)', '티어': f'공T{ti+1}',
-                                    '종가': close, '수량': shares,
-                                    '손익': 0, '사유': f'RSI{rsi:.0f}→{hold_days}일/{sell_pct:.2f}%',
-                                    'Cash': cash, 'Holdings': sum(s['shares']*close for s in atk_slots if s)})
-                        break   # 하루 1티어만
+                        buy_today = {
+                            'tier': f'공T{next_empty+1}',
+                            'trigger': buy_trigger_price,
+                            'alloc': alloc,
+                            'alloc_pct': alloc / total_after_sell * 100,
+                            'actual_amt': alloc,
+                            'shares': shares,
+                            'hold_days': hold_d,
+                            'sell_pct': sell_p,
+                        }
 
-        else:  # 방어모드
+        else:  # 방어
             if not np.isnan(_ma3):
                 cond1 = _ma3 * (1 + p['def_buy_ma'] / 100)
                 cond2 = prev_close * (1 + p['def_buy_prev'] / 100)
-                buy_trigger = min(cond1, cond2)
-                if close <= buy_trigger:
-                    for ti in range(def_tiers):
-                        if def_slots[ti] is None:
-                            total_val = cash + holdings_val
-                            w = def_weights[ti]
-                            alloc = total_val * w
-                            if alloc > cash:
-                                alloc = cash
-                            if alloc < 1:
-                                break
-                            shares     = alloc / close
-                            hold_until = i + p['def_hold']
-                            cash      -= alloc
-                            def_slots[ti] = {
+                buy_trigger_price = min(cond1, cond2)
+                next_empty = next((ti for ti in range(def_tiers) if def_slots[ti] is None), None)
+                if next_empty is not None:
+                    w = def_weights[next_empty]
+                    buy_alloc_shown = total_after_sell * w
+                    if close <= buy_trigger_price:
+                        alloc = min(total_after_sell * w, cash)
+                        if alloc >= 1:
+                            shares = alloc / close
+                            cash  -= alloc
+                            def_slots[next_empty] = {
                                 'buy_price': close, 'sell_target': None,
-                                'hold_until_idx': hold_until, 'shares': shares,
+                                'hold_until_idx': i + p['def_hold'], 'shares': shares,
                                 'mode': '방어', 'rsi': rsi, 'hold_days': p['def_hold'],
                             }
-                            log.append({'날짜': date, 'Action': '🟢매수(방)', '티어': f'방T{ti+1}',
-                                        '종가': close, '수량': shares,
-                                        '손익': 0, '사유': f'MA{p["def_ma_period"]} / {p["def_buy_ma"]}%',
-                                        'Cash': cash, 'Holdings': sum(s['shares']*close for s in def_slots if s)})
-                            break   # 하루 1티어만
+                            buy_today = {
+                                'tier': f'방T{next_empty+1}',
+                                'trigger': buy_trigger_price,
+                                'alloc': alloc,
+                                'alloc_pct': alloc / total_after_sell * 100,
+                                'actual_amt': alloc,
+                                'shares': shares,
+                                'hold_days': p['def_hold'],
+                                'sell_pct': p['def_sell_pct'],
+                            }
 
-        # 자산 계산
-        holdings_val = sum(s['shares']*close for s in atk_slots+def_slots if s is not None)
-        total_val = cash + holdings_val
-        total_assets_arr.append({'날짜': date, 'Total_Asset': total_val,
-                                  'Cash': cash, 'Mode': mode})
+        # ─── 종료 포트폴리오 상태 ───
+        holdings_val = sum(s['shares'] * close for s in atk_slots + def_slots if s is not None)
+        total_shares = sum(s['shares'] for s in atk_slots + def_slots if s is not None)
+        total_val    = cash + holdings_val
+        peak_asset   = max(peak_asset, total_val)
+        dd_pct       = (total_val / peak_asset - 1) * 100
+        cum_ret      = (total_val / init_cash - 1) * 100
+        asset_chg    = (total_val / prev_total - 1) * 100 if prev_total > 0 else 0.0
+        cash_pct     = cash / total_val * 100 if total_val > 0 else 100.0
+        prev_total   = total_val
 
-    # DataFrame 변환
-    asset_df = pd.DataFrame(total_assets_arr).set_index('날짜')
-    log_df   = pd.DataFrame(log) if log else pd.DataFrame()
+        # ─── 매도 집계 ───
+        if sells_today:
+            total_sell_amt    = sum(s['sell_cond'] * s['shares'] for s in sells_today)
+            total_sell_shares = sum(s['shares'] for s in sells_today)
+            total_pnl         = sum(s['pnl'] for s in sells_today)
+            reasons_unique    = list(dict.fromkeys(s['reason'] for s in sells_today))
+            sell_reason_str   = ','.join(reasons_unique)
+            first_cond        = sells_today[0]['sell_cond']
+            sell_cond_str = (f"${first_cond:.2f} 외 {len(sells_today)-1}건"
+                             if len(sells_today) > 1 else f"${first_cond:.2f}")
+        else:
+            total_sell_amt = total_sell_shares = total_pnl = None
+            sell_reason_str = sell_cond_str = None
+
+        # ─── 매도조건 표시 (매도 없을 때도 이론값 표시) ───
+        if sell_cond_str:
+            disp_sell_cond = sell_cond_str
+        elif mode == '방어' and not np.isnan(def_sell_trig) and any(s is not None for s in def_slots):
+            disp_sell_cond = f"${def_sell_trig:.2f}"
+        elif mode == '공격':
+            atk_targets = [s['sell_target'] for s in atk_slots if s is not None]
+            if atk_targets:
+                disp_sell_cond = (f"${atk_targets[0]:.2f} 외 {len(atk_targets)-1}건"
+                                  if len(atk_targets) > 1 else f"${atk_targets[0]:.2f}")
+            else:
+                disp_sell_cond = None
+        else:
+            disp_sell_cond = None
+
+        # ─── 매도% 표시 ───
+        if mode == '방어':
+            disp_sell_pct = f"{p['def_sell_pct']:.2f}%"
+        else:
+            if not np.isnan(rsi):
+                sp = calc_sell_pct(rsi, p['atk_sell_min'], p['atk_sell_max'], p['atk_sell_a'])
+                disp_sell_pct = f"{sp:.2f}%"
+            else:
+                disp_sell_pct = None
+
+        # ─── 행 빌드 ───
+        date_str = date.strftime('%y-%m-%d %a') if hasattr(date, 'strftime') else str(date)
+        row = {
+            '날짜':       date_str,
+            '종가':       round(close, 2),
+            '등락':       f"{daily_ret:+.2f}%",
+            'MA(n)':      round(_ma3, 2) if not np.isnan(_ma3) else None,
+            'MA(5)':      round(_ma5, 2) if not np.isnan(_ma5) else None,
+            'wRSI':       round(_wrsi, 1) if _wrsi is not None else '-',
+            '일RSI':      round(rsi, 1)   if not np.isnan(rsi) else None,
+            '모드':       mode,
+            'FI':         fi_str,
+            '매도%':      disp_sell_pct,
+            '매수조건':   f"${buy_trigger_price:.2f}" if buy_trigger_price is not None else None,
+            '매수할당':   f"${buy_alloc_shown:,.0f}"  if buy_alloc_shown  is not None else None,
+            '실매수비중': f"{buy_today['alloc_pct']:.0f}%" if buy_today else None,
+            '매수티어':   buy_today['tier']            if buy_today else None,
+            '실매수금':   round(buy_today['actual_amt'], 2) if buy_today else None,
+            '매수량':     round(buy_today['shares'], 1)     if buy_today else None,
+            '보유':       buy_today['hold_days']            if buy_today else None,
+            '매도조건':   disp_sell_cond,
+            '매도사유':   sell_reason_str,
+            '실매도금':   round(total_sell_amt,    2) if total_sell_amt    is not None else None,
+            '매도량':     round(total_sell_shares, 1) if total_sell_shares is not None else None,
+            '손익':       round(total_pnl,         2) if total_pnl         is not None else None,
+            '보유수량':   round(total_shares, 1),
+            '평가금':     round(holdings_val, 0),
+            '총자산':     round(total_val, 0),
+            '자산변동':   f"{asset_chg:+.2f}%",
+            '누적수익':   f"{cum_ret:+.2f}%",
+            'DD':         f"{dd_pct:.2f}%",
+            '현금':       round(cash, 0),
+            '현금비중':   f"{cash_pct:.1f}%",
+        }
+        daily_log.append(row)
+        asset_recs.append({'날짜': date, 'Total_Asset': total_val, 'Cash': cash, 'Mode': mode})
+
+    asset_df = pd.DataFrame(asset_recs).set_index('날짜')
+    log_df   = pd.DataFrame(daily_log) if daily_log else pd.DataFrame()
     return asset_df, log_df
 
 # ─────────────────────────────────────────────
@@ -556,25 +631,79 @@ with tab_log:
         st.info("백테스트 실행 후 로그가 표시됩니다.")
     else:
         log = st.session_state['log_df'].copy()
-        log['날짜'] = pd.to_datetime(log['날짜']).dt.strftime('%Y-%m-%d')
-        log['종가'] = log['종가'].apply(lambda x: f"${x:.2f}")
-        log['수량'] = log['수량'].apply(lambda x: f"{x:.1f}")
-        log['손익'] = log['손익'].apply(lambda x: f"${x:+,.0f}")
-        log['잔여현금'] = log['Cash'].apply(lambda x: f"${x:,.0f}")
 
-        # 필터
-        col1, col2 = st.columns(2)
-        filter_action = col1.multiselect("Action 필터",
-            options=log['Action'].unique().tolist(), default=log['Action'].unique().tolist())
-        filter_tier = col2.multiselect("티어 필터",
-            options=log['티어'].unique().tolist(), default=log['티어'].unique().tolist())
+        # ── 필터 ──
+        st.markdown("##### 🔍 필터")
+        fc1, fc2, fc3 = st.columns(3)
+        mode_opts  = log['모드'].unique().tolist()
+        mode_sel   = fc1.multiselect("모드", mode_opts, default=mode_opts)
+        show_buy   = fc2.checkbox("매수일만 보기", False)
+        show_sell  = fc3.checkbox("매도일만 보기", False)
 
-        filtered = log[log['Action'].isin(filter_action) & log['티어'].isin(filter_tier)]
-        st.dataframe(filtered[['날짜','Action','티어','종가','수량','손익','사유','잔여현금']],
-                     hide_index=True, use_container_width=True)
+        mask = log['모드'].isin(mode_sel)
+        if show_buy:
+            mask &= log['매수티어'].notna()
+        if show_sell:
+            mask &= log['매도사유'].notna()
+        filtered = log[mask].copy()
+
+        # ── 컬럼 그룹 선택 ──
+        st.markdown("##### 📋 표시 컬럼 그룹")
+        gc1, gc2, gc3, gc4 = st.columns(4)
+        grp_basic  = gc1.checkbox("기본 지표",   True)
+        grp_buy    = gc2.checkbox("매수 정보",   True)
+        grp_sell   = gc3.checkbox("매도 정보",   True)
+        grp_port   = gc4.checkbox("포트폴리오",  True)
+
+        show_cols = []
+        if grp_basic:
+            show_cols += ['날짜','종가','등락','MA(n)','MA(5)','wRSI','일RSI','모드','FI','매도%']
+        if grp_buy:
+            show_cols += ['매수조건','매수할당','실매수비중','매수티어','실매수금','매수량','보유']
+        if grp_sell:
+            show_cols += ['매도조건','매도사유','실매도금','매도량','손익']
+        if grp_port:
+            show_cols += ['보유수량','평가금','총자산','자산변동','누적수익','DD','현금','현금비중']
+        # 날짜는 항상 포함
+        if '날짜' not in show_cols:
+            show_cols = ['날짜'] + show_cols
+
+        available = [c for c in show_cols if c in filtered.columns]
+
+        # ── 통계 요약 ──
+        n_buy_days  = filtered['매수티어'].notna().sum()
+        n_sell_days = filtered['매도사유'].notna().sum()
+        n_pnl_pos   = (filtered['손익'].dropna() > 0).sum()
+        n_pnl_neg   = (filtered['손익'].dropna() < 0).sum()
+        total_pnl   = filtered['손익'].dropna().sum()
+
+        ms1, ms2, ms3, ms4 = st.columns(4)
+        ms1.metric("매수일 수",   f"{n_buy_days}일")
+        ms2.metric("매도일 수",   f"{n_sell_days}일")
+        ms3.metric("수익/손실 매도", f"{n_pnl_pos}건 / {n_pnl_neg}건")
+        ms4.metric("총 실현손익", f"${total_pnl:,.0f}")
+
+        st.dataframe(
+            filtered[available],
+            hide_index=True,
+            use_container_width=True,
+            height=500,
+            column_config={
+                '날짜':    st.column_config.TextColumn('날짜',     width=110),
+                '종가':    st.column_config.NumberColumn('종가',   format="$%.2f"),
+                '실매수금':st.column_config.NumberColumn('실매수금',format="$%.2f"),
+                '실매도금':st.column_config.NumberColumn('실매도금',format="$%.2f"),
+                '손익':    st.column_config.NumberColumn('손익',   format="$%.2f"),
+                '평가금':  st.column_config.NumberColumn('평가금', format="$%.0f"),
+                '총자산':  st.column_config.NumberColumn('총자산', format="$%.0f"),
+                '현금':    st.column_config.NumberColumn('현금',   format="$%.0f"),
+            }
+        )
+
+        # ── 다운로드 ──
         buf = io.BytesIO()
-        filtered.to_csv(buf, index=False, encoding='utf-8-sig')
-        st.download_button("📥 CSV 다운로드", buf.getvalue(),
+        log.to_csv(buf, index=False, encoding='utf-8-sig')
+        st.download_button("📥 전체 로그 CSV 다운로드", buf.getvalue(),
                            file_name="dual_sniper_log.csv", mime="text/csv")
 
 # ── 로그 비교 탭 ──
