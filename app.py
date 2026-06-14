@@ -1,716 +1,705 @@
-# 파일명: app.py
+# dual_sniper.py — Dual Sniper Pro 백테스트 Streamlit 앱
+# 전략 로직: 공격/방어 2모드, RSI 정규화 보유기간/매도조건, 5-티어 독립 운용
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-import os
-import requests
-from github import Github
-from io import StringIO
-import json
-import time
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
+import io
 
-# ---------------------------------------------------------
-# 1. 페이지 설정 & 커스텀 CSS
-# ---------------------------------------------------------
-st.set_page_config(page_title="동파법 마스터 v6.3", page_icon="💎", layout="wide")
-
+st.set_page_config(page_title="Dual Sniper Pro", page_icon="🎯", layout="wide")
 st.markdown("""
 <style>
-    @import url("https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.8/dist/web/static/pretendard.css");
-    html, body, [class*="css"] { font-family: 'Pretendard', sans-serif; }
-    .st-card { background-color: #ffffff; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05); border: 1px solid #e0e0e0; margin-bottom: 15px; }
-    @media (prefers-color-scheme: dark) { .st-card { background-color: #262730; border: 1px solid #41424b; } }
-    .badge-buy { background-color: #e6f4ea; color: #1e8e3e; padding: 4px 8px; border-radius: 4px; font-weight: bold; font-size: 0.9em; }
-    .badge-sell { background-color: #fce8e6; color: #d93025; padding: 4px 8px; border-radius: 4px; font-weight: bold; font-size: 0.9em; }
-    .badge-info { background-color: #e8f0fe; color: #1a73e8; padding: 4px 8px; border-radius: 4px; font-weight: bold; font-size: 0.9em; }
-    div[data-testid="stMetric"] { background-color: rgba(255, 255, 255, 0.05); border: 1px solid rgba(128, 128, 128, 0.2); padding: 15px; border-radius: 10px; text-align: center; }
+  @import url("https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.8/dist/web/static/pretendard.css");
+  html, body, [class*="css"] { font-family: 'Pretendard', sans-serif; }
 </style>
 """, unsafe_allow_html=True)
 
-PARAMS = {
-    'Safe':    {'buy': 3.0, 'sell': 0.5, 'time': 35, 'desc': '🛡️ 방어 (Safe)'},
-    'Offense': {'buy': 5.0, 'sell': 3.0, 'time': 7,  'desc': '⚔️ 공세 (Offense)'}
-}
-MAX_SLOTS = 7
-RESET_CYCLE = 10
+# ─────────────────────────────────────────────
+# 기본 파라미터 상수
+# ─────────────────────────────────────────────
+DEFAULT = dict(
+    ticker        = "SOXL",
+    init_cash     = 10000.0,
+    # 공격모드
+    atk_tiers     = 5,
+    atk_buy_pct   = 0.5,    # FI+ 시 매수조건 (전일 종가 대비 %)
+    atk_fi_neg    = -0.1,   # FI- 시 매수조건 (고정)
+    atk_hold_nmin = 7,      # 보유기간 최소(일)
+    atk_hold_nmax = 30,     # 보유기간 최대(일)
+    atk_hold_a    = 2.0,    # 보유기간 α
+    atk_sell_min  = 0.1,    # 매도조건 최소(%)
+    atk_sell_max  = 3.0,    # 매도조건 최대(%)
+    atk_sell_a    = 0.4,    # 매도조건 α
+    atk_ma_period = 5,      # 매도보류 MA 기준
+    # 방어모드
+    def_tiers     = 5,
+    def_hold      = 8,      # 보유기간(일, 고정)
+    def_buy_ma    = -0.6,   # MA 대비 매수조건(%)
+    def_buy_prev  = -5.5,   # 전일 종가 대비 매수조건(%)
+    def_sell_pct  = 0.7,    # MA 대비 매도조건(%)
+    def_ma_period = 3,      # MA 기준
+    def_weights   = [6,13,20,27,34],  # 티어별 비중(%)
+    # 모드 전환
+    mode_rsi_up   = 55.0,   # wRSI 상향 돌파 시 공격모드
+    mode_rsi_dn   = 50.0,   # wRSI 하향 돌파 시 방어모드
+    rsi_period    = 14,
+)
 
-# GitHub 설정
-try:
-    GH_TOKEN = st.secrets["general"]["GH_TOKEN"]
-except:
-    st.error("🚨 GitHub 토큰 오류: Streamlit Secrets에 GH_TOKEN을 설정해주세요.")
-    st.stop()
+# ─────────────────────────────────────────────
+# 지표 계산
+# ─────────────────────────────────────────────
+def calc_rsi(series, period=14):
+    delta = series.diff()
+    gain  = delta.clip(lower=0).ewm(alpha=1/period, min_periods=period).mean()
+    loss  = (-delta.clip(upper=0)).ewm(alpha=1/period, min_periods=period).mean()
+    rs    = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
 
-REPO_KEY = "yongma11/dongpa6" 
-HOLDINGS_FILE = "my_holdings.csv"
-JOURNAL_FILE = "trading_journal.csv"
-EQUITY_FILE = "equity_history.csv"
-SETTINGS_FILE = "settings.json"
+def calc_ma(series, period):
+    return series.rolling(period).mean()
 
-# ---------------------------------------------------------
-# 2. 데이터 & 엔진 함수
-# ---------------------------------------------------------
-@st.cache_data(ttl=600)
-def get_data_final(period='max'):
-    for attempt in range(3):
-        try:
-            start_date = '2005-01-01'
-            end_date = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
-            
-            df_qqq = yf.download("QQQ", start=start_date, end=end_date, progress=False, auto_adjust=True)
-            df_soxl = yf.download("SOXL", start=start_date, end=end_date, progress=False, auto_adjust=True)
-            
-            if df_qqq.empty or df_soxl.empty:
-                time.sleep(1)
-                continue
+def load_data(ticker, start, end, rsi_period=14, mode_up=55, mode_dn=50):
+    """yfinance 데이터 로드 + 지표 계산"""
+    raw = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
+    if raw.empty:
+        return None
+    df = pd.DataFrame({
+        'Open' : raw['Open'].squeeze(),
+        'High' : raw['High'].squeeze(),
+        'Low'  : raw['Low'].squeeze(),
+        'Close': raw['Close'].squeeze(),
+        'Volume': raw['Volume'].squeeze(),
+    }).dropna()
+    df.index = pd.to_datetime(df.index)
 
-            if isinstance(df_qqq.columns, pd.MultiIndex): qqq_close = df_qqq['Close']['QQQ']
-            else: qqq_close = df_qqq['Close']
-            
-            if isinstance(df_soxl.columns, pd.MultiIndex): soxl_close = df_soxl['Close']['SOXL']
-            else: soxl_close = df_soxl['Close']
+    # 일봉 RSI
+    df['RSI'] = calc_rsi(df['Close'], rsi_period)
 
-            df = pd.DataFrame({'QQQ': qqq_close, 'SOXL': soxl_close})
-            df = df.sort_index().ffill().bfill().dropna()
-            df.index = df.index.tz_localize(None)
-            
-            return df
+    # Force Index (부호만: + or -)
+    df['FI_pos'] = (df['Close'] >= df['Close'].shift(1))   # True=양수, False=음수
 
-        except Exception as e:
-            time.sleep(1)
-            
-    return None
+    # MA(3), MA(5)
+    df['MA3'] = calc_ma(df['Close'], 3)
+    df['MA5'] = calc_ma(df['Close'], 5)
 
-def calc_mode_series(df_qqq):
-    if df_qqq is None: return None, None
-    qqq_weekly = df_qqq.resample('W-FRI').last()
-    delta = qqq_weekly.diff()
-    up = delta.clip(lower=0)
-    down = -1 * delta.clip(upper=0)
-    ema_up = up.ewm(com=13, adjust=False).mean()
-    ema_down = down.ewm(com=13, adjust=False).mean()
-    rs = ema_up / ema_down
-    rsi_series = 100 - (100 / (1 + rs))
-    
-    modes = []
-    current_mode = 'Safe'
-    for i in range(len(rsi_series)):
-        if i < 2:
-            modes.append(current_mode)
+    # 주봉 RSI (weekly resample → RSI)
+    weekly = df['Close'].resample('W-FRI').last().dropna()
+    wrsi   = calc_rsi(weekly, rsi_period).rename('wRSI')
+    df     = df.join(wrsi.resample('D').last().ffill(), how='left')
+
+    # 모드 전환 (wRSI 기반 히스테레시스)
+    mode = []
+    cur  = '방어'
+    for w in df['wRSI']:
+        if pd.isna(w):
+            mode.append(cur)
             continue
-        rsi_t1 = rsi_series.iloc[i-1]
-        rsi_t2 = rsi_series.iloc[i-2]
-        if np.isnan(rsi_t1) or np.isnan(rsi_t2):
-            modes.append(current_mode)
-            continue
-        safe = ((rsi_t2 > 65) and (rsi_t2 > rsi_t1)) or ((40 < rsi_t2 < 50) and (rsi_t2 > rsi_t1)) or ((rsi_t1 < 50) and (rsi_t2 > 50))
-        offense = ((rsi_t2 < 35) and (rsi_t2 < rsi_t1)) or ((50 < rsi_t2 < 60) and (rsi_t2 < rsi_t1)) or ((rsi_t1 > 50) and (rsi_t2 < 50))
-        if safe: current_mode = 'Safe'
-        elif offense: current_mode = 'Offense'
-        modes.append(current_mode)
-    
-    weekly_mode = pd.Series(modes, index=qqq_weekly.index)
-    return weekly_mode.resample('D').ffill(), rsi_series.resample('D').ffill()
+        if cur == '방어' and w >= mode_up:
+            cur = '공격'
+        elif cur == '공격' and w < mode_dn:
+            cur = '방어'
+        mode.append(cur)
+    df['Mode'] = mode
 
-def get_repo():
-    g = Github(GH_TOKEN)
-    try: return g.get_repo(REPO_KEY)
-    except: return None
+    return df
 
-def load_settings():
-    try:
-        repo = get_repo()
-        if repo:
-            contents = repo.get_contents(SETTINGS_FILE)
-            return json.loads(contents.decoded_content.decode("utf-8"))
-    except: pass
-    return {"start_date": "2025-01-01", "init_cap": 100000.0}
+def load_data_from_log(log_df):
+    """업로드된 Dual Sniper 로그에서 모드/가격 시리즈 추출"""
+    log = log_df.copy()
+    log = log[~log['날짜'].isna()].copy()
+    log = log[log['날짜'].str.match(r'\d{2}-\d{2}-\d{2}', na=False)].copy()
+    log['날짜'] = '20' + log['날짜'].str.split(' ').str[0]
+    log['날짜'] = pd.to_datetime(log['날짜'], format='%Y-%m-%d', errors='coerce')
+    log = log.dropna(subset=['날짜']).set_index('날짜')
 
-def save_settings(settings_dict):
-    try:
-        repo = get_repo()
-        if repo:
-            json_str = json.dumps(settings_dict)
-            try:
-                contents = repo.get_contents(SETTINGS_FILE)
-                repo.update_file(contents.path, "Update settings", json_str, contents.sha)
-            except:
-                repo.create_file(SETTINGS_FILE, "Create settings", json_str)
-    except Exception as e: print(f"설정 저장 실패: {e}")
+    close_s = log['종가'].str.replace('$','',regex=False).astype(float)
+    mode_s  = log['모드']
+    rsi_s   = pd.to_numeric(log['일RSI'], errors='coerce')
+    fi_pos_s = (log['FI'] == '=+')   # True=양수 FI
+    ma3_s   = pd.to_numeric(log['MA(n)'], errors='coerce')
+    ma5_s   = pd.to_numeric(log['MA(5)'], errors='coerce')
 
-def load_csv(filename, columns):
-    try:
-        repo = get_repo()
-        if repo:
-            try:
-                contents = repo.get_contents(filename)
-                csv_string = contents.decoded_content.decode("utf-8")
-                return pd.read_csv(StringIO(csv_string))
-            except: pass
-    except: pass
-    return pd.DataFrame(columns=columns)
+    out = pd.DataFrame({
+        'Close':   close_s,
+        'RSI':     rsi_s,
+        'FI_pos':  fi_pos_s,
+        'MA3':     ma3_s,
+        'MA5':     ma5_s,
+        'Mode':    mode_s,
+    })
+    return out.dropna(subset=['Close'])
 
-def save_csv(df, filename):
-    try:
-        repo = get_repo()
-        if repo:
-            csv_string = df.to_csv(index=False)
-            try:
-                contents = repo.get_contents(filename)
-                repo.update_file(contents.path, f"Update {filename}", csv_string, contents.sha)
-            except:
-                repo.create_file(filename, f"Create {filename}", csv_string)
-    except Exception as e: st.error(f"GitHub 저장 실패: {e}")
+# ─────────────────────────────────────────────
+# 정규화 공식
+# ─────────────────────────────────────────────
+RSI_LOW   = 35
+RSI_RANGE = 30
 
-def auto_sync_engine(df, start_date, init_cap):
-    if df is None: return None, None, None, None
-    mode_daily, _ = calc_mode_series(df['QQQ'])
-    sim_df = pd.concat([df['SOXL'], mode_daily], axis=1).dropna()
-    sim_df.columns = ['Price', 'Mode']
-    end_date = datetime.now() - timedelta(days=1)
-    mask = (sim_df.index >= pd.to_datetime(start_date)) & (sim_df.index <= pd.to_datetime(end_date))
-    sim_df = sim_df[mask]
-    if sim_df.empty: return None, None, None, None
+def rsi_x(rsi):
+    return max(0.0, min(1.0, (rsi - RSI_LOW) / RSI_RANGE))
 
-    sim_df['Prev_Price'] = sim_df['Price'].shift(1)
-    sim_df = sim_df.dropna()
+def calc_hold_days(rsi, n_min, n_max, alpha):
+    x = rsi_x(rsi)
+    return max(1, int(round(n_min + (n_max - n_min) * (1 - x) ** (1 / alpha))))
 
-    real_cash = init_cap
-    cum_profit = 0.0
-    cum_loss = 0.0
-    slots = []
-    journal = []
-    daily_equity = []
-    full_action_log = []
-    
-    cycle_days = 0
-    local_params = {'Safe': {'buy': 0.03, 'sell': 1.005, 'time': 35}, 'Offense': {'buy': 0.05, 'sell': 1.03, 'time': 7}}
+def calc_sell_pct(rsi, sell_min, sell_max, alpha):
+    x = rsi_x(rsi)
+    return sell_min + (sell_max - sell_min) * (1 - x) ** (1 / alpha)
 
-    for date, row in sim_df.iterrows():
-        price = row['Price']
-        mode = row['Mode']
-        cycle_days += 1
-        if cycle_days >= 10:
-            virtual = init_cap + (cum_profit * 0.7) - (cum_loss * 0.6)
-            if virtual < 1000: virtual = 1000
-            current_slot_size = virtual / 7
-            cycle_days = 0
-        else:
-            if 'current_slot_size' not in locals(): current_slot_size = init_cap / 7
+# ─────────────────────────────────────────────
+# 백테스트 엔진
+# ─────────────────────────────────────────────
+def run_backtest(df, p):
+    """
+    df: Close, RSI, FI_pos, MA3, MA5, Mode 컬럼 포함
+    p : 파라미터 dict
+    """
+    init_cash    = p['init_cash']
+    atk_tiers    = p['atk_tiers']
+    def_tiers    = p['def_tiers']
+    def_weights  = [w/100 for w in p['def_weights']]
+    # 방어 티어 누적 비중 (할당 계산용)
+    def_cum      = [sum(def_weights[:i+1]) for i in range(def_tiers)]
 
-        sold_idx = []
-        for i in range(len(slots)-1, -1, -1):
-            s = slots[i]
-            s['days'] += 1
-            rule = local_params.get(s['birth_mode'], local_params['Safe'])
-            if (price >= s['buy_price'] * rule['sell']) or (s['days'] >= rule['time']):
-                rev = s['shares'] * price
-                prof = rev - (s['shares'] * s['buy_price'])
-                current_holdings_val = sum(slots[k]['shares'] * price for k in range(len(slots)) if k != i)
-                equity_at_sell = real_cash + rev + current_holdings_val
-                journal.append({
-                    "날짜": date.date(), "총자산": equity_at_sell, "수익금": prof,
-                    "수익률": (prof / (equity_at_sell - prof)) * 100 if (equity_at_sell - prof) > 0 else 0
-                })
-                full_action_log.append({
-                    "날짜": date.date(), "구분": "매도 (Sell)", "가격": f"${price:.2f}", 
-                    "수량": s['shares'], "수익금": f"${prof:.2f}", "비고": "익절/기간만료"
-                })
-                real_cash += rev
-                if prof > 0: cum_profit += prof
-                else: cum_loss += abs(prof)
-                sold_idx.append(i)
-        for i in sold_idx: del slots[i]
-        
-        chg = (price - row['Prev_Price']) / row['Prev_Price']
-        curr_rule = local_params.get(mode, local_params['Safe'])
-        if chg <= curr_rule['buy']:
-            if (len(slots) < 7) or (real_cash >= current_slot_size * 0.98):
-                amt = min(real_cash, current_slot_size)
-                if amt > 10:
-                    shares = amt / price
-                    real_cash -= amt
-                    tr = PARAMS[mode]
-                    tg = price * (1 + tr['sell']/100)
-                    cd = date + timedelta(days=tr['time']*1.45)
-                    slots.append({
-                        '매수일': date.date(), '모드': mode, '매수가': price, '수량': int(shares),
-                        '목표가': tg, '손절기한': cd.date(), 'buy_price': price, 'shares': int(shares), 'days': 0, 'birth_mode': mode
-                    })
-                    full_action_log.append({
-                        "날짜": date.date(), "구분": "매수 (Buy)", "가격": f"${price:.2f}", 
-                        "수량": int(shares), "수익금": "-", "비고": f"{mode} 진입"
-                    })
-        
-        total_holdings_value = sum(s['shares'] * price for s in slots)
-        daily_total_equity = real_cash + total_holdings_value
-        daily_equity.append({"날짜": date.date(), "총자산": daily_total_equity})
-    
-    final_holdings = []
-    for s in slots:
-        final_holdings.append({
-            "매수일": s['매수일'], "모드": s['모드'], "매수가": s['매수가'], 
-            "수량": s['수량'], "목표가": s['목표가'], "손절기한": s['손절기한']
-        })
-    
-    df_actions = pd.DataFrame(full_action_log)
-    if not df_actions.empty:
-        df_actions = df_actions.sort_values(by="날짜", ascending=False).reset_index(drop=True)
+    dates  = df.index
+    closes = df['Close'].values
+    rsis   = df['RSI'].values
+    fi_pos = df['FI_pos'].values    # True=FI양수, False=FI음수(매수 신호)
+    ma3    = df['MA3'].values
+    ma5    = df['MA5'].values
+    modes  = df['Mode'].values
 
-    return pd.DataFrame(final_holdings), pd.DataFrame(journal), pd.DataFrame(daily_equity), df_actions
+    cash   = init_cash
+    log    = []
 
-def run_backtest_fixed(df, start_date, end_date, init_cap):
-    if df is None: return None, None, None, None
-    mode_daily, rsi_daily = calc_mode_series(df['QQQ'])
-    sim_df = pd.concat([df['SOXL'], mode_daily, rsi_daily], axis=1).dropna()
-    sim_df.columns = ['Price', 'Mode', 'RSI']
-    mask = (sim_df.index >= pd.to_datetime(start_date)) & (sim_df.index <= pd.to_datetime(end_date))
-    sim_df = sim_df[mask]
-    if sim_df.empty: return None, None, None, None
-    sim_df['Prev_Price'] = sim_df['Price'].shift(1)
-    sim_df = sim_df.dropna()
-    
-    real_cash = init_cap
-    cum_profit = 0.0
-    cum_loss = 0.0
-    slots = []
-    equity_curve = []
-    debug_logs = []
-    gross_profit = 0.0
-    gross_loss = 0.0
-    local_params = {'Safe': {'buy': 0.03, 'sell': 1.005, 'time': 35}, 'Offense': {'buy': 0.05, 'sell': 1.03, 'time': 7}}
-    
-    cycle_days = 0
-    current_slot_size = init_cap / 7
+    # 슬롯: {'buy_date_idx','buy_price','sell_target','hold_until_idx','shares','tier','mode','rsi','hold_days'}
+    atk_slots = [None] * atk_tiers
+    def_slots = [None] * def_tiers
 
-    for date, row in sim_df.iterrows():
-        price = row['Price']
-        mode = row['Mode']
-        rsi_val = row['RSI']
-        cycle_days += 1
-        
-        if cycle_days >= 10:
-            virtual = init_cap + (cum_profit * 0.7) - (cum_loss * 0.6)
-            if virtual < 1000: virtual = 1000
-            current_slot_size = virtual / 7
-            cycle_days = 0
-        
-        action_today = "관망"
-        sold_idx = []
-        for i in range(len(slots)-1, -1, -1):
-            s = slots[i]
-            s['days'] += 1
-            rule = local_params.get(s['birth_mode'], local_params['Safe'])
-            if (price >= s['buy_price'] * rule['sell']) or (s['days'] >= rule['time']):
-                rev = s['shares'] * price
-                prof = rev - (s['shares'] * s['buy_price'])
-                real_cash += rev
-                if prof > 0: 
-                    cum_profit += prof
-                    gross_profit += prof
-                else: 
-                    cum_loss += abs(prof)
-                    gross_loss += abs(prof)
-                sold_idx.append(i)
-                action_today = "매도 (익절/손절)"
-        for i in sold_idx: del slots[i]
-        
-        chg = (price - row['Prev_Price']) / row['Prev_Price']
-        curr_rule = local_params.get(mode, local_params['Safe'])
-        if chg <= curr_rule['buy']:
-            if (len(slots) < 7) or (real_cash >= current_slot_size * 0.98):
-                amt = min(real_cash, current_slot_size)
-                if amt > 10:
-                    shares = amt / price
-                    real_cash -= amt
-                    slots.append({'buy_price': price, 'shares': shares, 'days': 0, 'birth_mode': mode})
-                    action_today = "매수 (LOC)"
-        
-        current_equity = real_cash + sum(s['shares']*price for s in slots)
-        equity_curve.append({'Date': date, 'Equity': current_equity})
-        debug_logs.append({"날짜": date.date(), "RSI (주봉)": f"{rsi_val:.2f}", "적용 모드": mode, "SOXL 종가": f"${price:.2f}", "매매 행동": action_today, "총 자산": f"${current_equity:,.0f}"})
-    
-    res_df = pd.DataFrame(equity_curve).set_index('Date')
-    df_debug = pd.DataFrame(debug_logs).set_index("날짜")
-    
-    if not res_df.empty:
-        res_df['Returns'] = res_df['Equity'].pct_change()
-        downside_returns = res_df.loc[res_df['Returns'] < 0, 'Returns']
-        downside_std = downside_returns.std() * np.sqrt(252)
-        total_ret = (res_df['Equity'].iloc[-1] / init_cap) - 1
-        days = (res_df.index[-1] - res_df.index[0]).days
-        cagr = (1 + total_ret) ** (365 / days) - 1 if days > 0 else 0
-        sortino = cagr / downside_std if downside_std > 0 else 0
-        metrics = {'profit_factor': gross_profit / gross_loss if gross_loss > 0 else 99.9, 'sortino': sortino}
-    else:
-        metrics = {'profit_factor': 0, 'sortino': 0}
+    # 방어 티어별 다음 빈 슬롯 인덱스 추적
+    def_next_tier = 0   # 다음에 채울 티어 번호 (0-based)
+    atk_next_tier = 0
 
-    yearly_stats = []
-    years = res_df.index.year.unique()
-    def calc_mdd(series):
-        peak = series.cummax()
-        dd = (series - peak) / peak
-        return dd.min()
-    prev_equity = init_cap
-    for yr in years:
-        df_yr = res_df[res_df.index.year == yr]
-        end_equity = df_yr['Equity'].iloc[-1]
-        yr_return = (end_equity - prev_equity) / prev_equity
-        yr_mdd = calc_mdd(df_yr['Equity'])
-        yearly_stats.append({"연도": yr, "수익률": yr_return, "MDD": yr_mdd, "기말자산": end_equity})
-        prev_equity = end_equity
-    return res_df, metrics, pd.DataFrame(yearly_stats).set_index("연도"), df_debug
+    total_assets_arr = []
 
-# ---------------------------------------------------------
-# 3. 메인 UI
-# ---------------------------------------------------------
-def main():
-    st.title("💎 Dongpa for Chayoung")
-    
-    tab_trade, tab_backtest, tab_logic = st.tabs(["💎 실전 트레이딩", "🧪 백테스트", "📚 전략 로직"])
+    for i, date in enumerate(dates):
+        close = closes[i]
+        rsi   = rsis[i]
+        mode  = modes[i]
+        fi_p  = fi_pos[i]
+        _ma3  = ma3[i]
+        _ma5  = ma5[i]
+        prev_close = closes[i-1] if i > 0 else close
+        prev2_close = closes[i-2] if i > 1 else prev_close
 
-    with st.spinner("데이터 로딩 중... (3회 재시도)"):
-        df = get_data_final()
-    
-    offline_mode = False
-    if df is None:
-        offline_mode = True
-        st.warning("⚠️ **오프라인 모드:** 현재가 업데이트 중단. (기존 데이터 표시)")
-    
-    if not offline_mode:
-        mode_s, rsi_s = calc_mode_series(df['QQQ'])
-        curr_mode = mode_s.iloc[-1]
-        curr_rsi = rsi_s.iloc[-1]
-        soxl_price = df['SOXL'].iloc[-1]
-        prev_close = df['SOXL'].iloc[-2]
-    else:
-        curr_mode = 'Safe'
-        curr_rsi = 0.0
-        soxl_price = 0.0
-        prev_close = 0.0
+        # ── 오늘 MOC 주문 처리 전, 평가 ──
+        holdings_val = 0.0
+        for s in atk_slots + def_slots:
+            if s is not None:
+                holdings_val += s['shares'] * close
 
-    settings = load_settings()
-    if 'auto_run_done' not in st.session_state: st.session_state['auto_run_done'] = False
+        # ─── 매도 처리 ───
+        sold_tiers_today = set()   # MOC 매도된 티어
 
-    try:
-        saved_start_date = datetime.strptime(settings.get("start_date", "2025-01-01"), "%Y-%m-%d").date()
-        saved_init_cap = float(settings.get("init_cap", 100000.0))
-    except:
-        saved_start_date = datetime(2025, 1, 1).date()
-        saved_init_cap = 100000.0
-
-    if not offline_mode and ('holdings' not in st.session_state or not st.session_state['auto_run_done']):
-        h_auto, j_auto, eq_auto, log_auto = auto_sync_engine(df, saved_start_date, saved_init_cap)
-        if h_auto is not None:
-            old_h = load_csv(HOLDINGS_FILE, h_auto.columns)
-            if len(h_auto) != len(old_h) or (not old_h.empty and str(h_auto.iloc[-1].values) != str(old_h.iloc[-1].values)):
-                save_csv(h_auto, HOLDINGS_FILE)
-                save_csv(j_auto, JOURNAL_FILE)
-                save_csv(eq_auto, EQUITY_FILE)
-            st.session_state['holdings'] = h_auto
-            st.session_state['journal'] = j_auto
-            st.session_state['equity_history'] = eq_auto
-            st.session_state['action_log'] = log_auto
-            st.session_state['auto_run_done'] = True
-    
-    if 'holdings' not in st.session_state:
-        st.session_state['holdings'] = load_csv(HOLDINGS_FILE, ["매수일", "모드", "매수가", "수량", "목표가", "손절기한"])
-    if 'journal' not in st.session_state:
-        st.session_state['journal'] = load_csv(JOURNAL_FILE, ["날짜", "총자산", "수익금", "수익률"])
-    if 'equity_history' not in st.session_state:
-        st.session_state['equity_history'] = load_csv(EQUITY_FILE, ["날짜", "총자산"])
-    if 'action_log' not in st.session_state:
-        st.session_state['action_log'] = pd.DataFrame()
-
-    with tab_trade:
-        with st.sidebar:
-            st.header("🤖 설정 및 초기화")
-            auto_start_date = st.date_input("전략 시작일", value=saved_start_date)
-            auto_init_cap = st.number_input("시작 원금 ($)", value=saved_init_cap, step=100.0)
-            
-            if not offline_mode:
-                if st.button("🔄 설정 변경 및 재동기화", type="primary"):
-                    new_settings = {"start_date": auto_start_date.strftime("%Y-%m-%d"), "init_cap": auto_init_cap}
-                    save_settings(new_settings)
-                    st.session_state['auto_run_done'] = False
-                    st.rerun()
-            else:
-                st.button("🚫 오프라인 (설정 변경 불가)", disabled=True)
-
-            st.markdown("---")
-            if st.button("🗑️ 데이터 초기화"):
-                empty_df = pd.DataFrame(columns=["매수일", "모드", "매수가", "수량", "목표가", "손절기한"])
-                empty_j = pd.DataFrame(columns=["날짜", "총자산", "수익금", "수익률"])
-                empty_eq = pd.DataFrame(columns=["날짜", "총자산"])
-                save_csv(empty_df, HOLDINGS_FILE)
-                save_csv(empty_j, JOURNAL_FILE)
-                save_csv(empty_eq, EQUITY_FILE)
-                st.session_state['holdings'] = empty_df
-                st.session_state['journal'] = empty_j
-                st.session_state['equity_history'] = empty_eq
-                st.session_state['action_log'] = pd.DataFrame()
-                st.rerun()
-
-            today = datetime.now().date()
-            cycle = ((today - saved_start_date).days % RESET_CYCLE) + 1
-            st.info(f"🔄 사이클: **{cycle}일차** / 10일")
-
-        r = PARAMS[curr_mode]
-        slot_sz = saved_init_cap / MAX_SLOTS
-        
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("시장 모드", f"{r['desc']}", f"RSI {curr_rsi:.2f}" if not offline_mode else "Offline", delta_color="inverse")
-        c2.metric("SOXL 현재가", f"${soxl_price:.2f}" if not offline_mode else "Offline", f"{((soxl_price-prev_close)/prev_close)*100:.2f}%" if not offline_mode and prev_close > 0 else "-")
-        c3.metric("1슬롯 할당금", f"${slot_sz:,.0f}")
-        c4.metric("매매 사이클", f"{cycle}일차")
-        st.markdown("---")
-
-        order_date_str = today.strftime("%Y-%m-%d")
-        st.subheader(f"📋 오늘의 주문 (Today's Orders - {order_date_str})")
-        
-        if offline_mode:
-            st.warning("오프라인 모드에서는 최신 주문을 생성할 수 없습니다.")
-        else:
-            df_h = st.session_state['holdings']
-            sell_orders = []
-            buy_orders = []
-            
-            if not df_h.empty:
-                df_h['손절기한'] = pd.to_datetime(df_h['손절기한']).dt.date
-                for idx, row in df_h.iterrows():
-                    if row['손절기한'] <= today:
-                        sell_orders.append(f"**[매도]** 티어{idx+1}: **{row['수량']}주** (시장가) - **MOC (기간만료)**")
+        # 공격모드 슬롯 매도 체크
+        if mode == '공격':
+            for ti in range(atk_tiers):
+                s = atk_slots[ti]
+                if s is None:
+                    continue
+                if s['mode'] != '공격':
+                    # 모드 전환으로 남은 포지션 → 즉시 청산
+                    cash += s['shares'] * close
+                    log.append({'날짜': date, 'Action': '🔄모드청산', '티어': f'공T{ti+1}',
+                                '종가': close, '수량': s['shares'], '손익': (close-s['buy_price'])*s['shares'],
+                                '사유': '모드전환', 'Cash': cash, 'Holdings': holdings_val})
+                    atk_slots[ti] = None
+                    continue
+                # 보유기간 만료 (MOC)
+                if i >= s['hold_until_idx']:
+                    pnl  = (close - s['buy_price']) * s['shares']
+                    cash += s['shares'] * close
+                    log.append({'날짜': date, 'Action': '🔴매도(공)', '티어': f'공T{ti+1}',
+                                '종가': close, '수량': s['shares'], '손익': pnl,
+                                '사유': 'MOC', 'Cash': cash, 'Holdings': 0})
+                    atk_slots[ti] = None
+                    sold_tiers_today.add(('공', ti))
+                    continue
+                # 수익 목표 달성
+                if close >= s['sell_target']:
+                    # MA5 보류 조건: 전일 종가 > 전일 MA5 이면 T1만 보류
+                    if ti == 0 and i > 0 and closes[i-1] > (ma5[i-1] if not np.isnan(ma5[i-1]) else 0):
+                        pass   # 보류
                     else:
-                        sell_orders.append(f"**[매도]** 티어{idx+1}: **{row['수량']}주** (${row['목표가']:.2f}) - **LOC (익절)**")
-            
-            if soxl_price > 0:
-                b_lim = prev_close * (1 + r['buy']/100)
-                b_qty = int(slot_sz / soxl_price)
-                buy_orders.append(f"**[매수]** 신규: **{b_qty}주 (예상)** (${b_lim:.2f}) - **LOC (진입)**")
-                
-            if not sell_orders and not buy_orders:
-                st.info("오늘 예정된 주문이 없습니다. (No Orders)")
-            else:
-                if sell_orders:
-                    for order in sell_orders:
-                        st.markdown(f"""
-                        <div class="st-card" style="border-left: 5px solid #d93025;">
-                            <span class="badge-sell">매도</span> {order.replace('**[매도]**', '')}
-                        </div>
-                        """, unsafe_allow_html=True)
-                if buy_orders:
-                    for order in buy_orders:
-                        st.markdown(f"""
-                        <div class="st-card" style="border-left: 5px solid #1e8e3e;">
-                            <span class="badge-buy">매수</span> {order.replace('**[매수]**', '')}
-                        </div>
-                        """, unsafe_allow_html=True)
+                        pnl  = (close - s['buy_price']) * s['shares']
+                        cash += s['shares'] * close
+                        log.append({'날짜': date, 'Action': '🔴매도(공)', '티어': f'공T{ti+1}',
+                                    '종가': close, '수량': s['shares'], '손익': pnl,
+                                    '사유': f'수익({s["sell_pct"]:.2f}%)', 'Cash': cash, 'Holdings': 0})
+                        atk_slots[ti] = None
+                        sold_tiers_today.add(('공', ti))
 
-        st.markdown("---")
+        # 방어모드 슬롯 매도 체크
+        for ti in range(def_tiers):
+            s = def_slots[ti]
+            if s is None:
+                continue
+            # 모드가 방어→공격 전환되었어도 방어 포지션은 유지 (별도 풀)
+            # 보유기간 만료 (MOC)
+            if i >= s['hold_until_idx']:
+                pnl  = (close - s['buy_price']) * s['shares']
+                cash += s['shares'] * close
+                log.append({'날짜': date, 'Action': '🔴매도(방)', '티어': f'방T{ti+1}',
+                            '종가': close, '수량': s['shares'], '손익': pnl,
+                            '사유': 'MOC', 'Cash': cash, 'Holdings': 0})
+                def_slots[ti] = None
+                sold_tiers_today.add(('방', ti))
+                continue
+            # MA 매도 조건
+            factor = 1 + p['def_sell_pct'] / 100
+            if not (np.isnan(prev_close) or np.isnan(prev2_close)):
+                sell_trigger = factor * (prev_close + prev2_close) / (p['def_ma_period'] - factor)
+                if close >= sell_trigger:
+                    pnl  = (close - s['buy_price']) * s['shares']
+                    cash += s['shares'] * close
+                    log.append({'날짜': date, 'Action': '🔴매도(방)', '티어': f'방T{ti+1}',
+                                '종가': close, '수량': s['shares'], '손익': pnl,
+                                '사유': 'MA', 'Cash': cash, 'Holdings': 0})
+                    def_slots[ti] = None
+                    sold_tiers_today.add(('방', ti))
 
-        st.subheader("📊 나의 티어 현황 (Cloud 저장)")
-        df_h = st.session_state['holdings']
-        if not df_h.empty:
-            df_h['매수일'] = pd.to_datetime(df_h['매수일']).dt.date
-            df_h.index = range(1, len(df_h) + 1)
-            df_h.index.name = "티어"
-            
-            if not offline_mode:
-                current_yields = ((soxl_price - df_h['매수가']) / df_h['매수가'] * 100)
-                yield_display = [f"{'🔺' if y > 0 else '🔻'} {y:.2f} %" for y in current_yields]
-                df_h['수익률'] = yield_display
-                status_list = ["🚨 MOC 매도" if row['손절기한'] <= today else "🔵 LOC 대기" for _, row in df_h.iterrows()]
-                df_h['상태'] = status_list
-                
-                total_qty = df_h['수량'].sum()
-                total_invested = (df_h['매수가'] * df_h['수량']).sum()
-                avg_price = total_invested / total_qty if total_qty > 0 else 0
-                current_val = total_qty * soxl_price
-                total_profit = current_val - total_invested
-                total_yield_pct = (total_profit / total_invested * 100) if total_invested > 0 else 0
-                
-                st.markdown("#### 📌 전체 계좌 요약")
-                sc1, sc2, sc3, sc4 = st.columns(4)
-                sc1.metric("총 보유수량", f"{total_qty} 주")
-                sc2.metric("통합 평단가", f"${avg_price:,.2f}")
-                sc3.metric("총 평가손익", f"${total_profit:,.2f}", delta_color="normal")
-                sc4.metric("평균 수익률", f"{total_yield_pct:,.2f}%", delta_color="normal")
-            
-            st.markdown("👇 **보유 티어 상세 내역 (편집 가능)**")
-            edited_h = st.data_editor(
-                df_h, num_rows="dynamic", use_container_width=True, key="h_edit",
-                column_config={"수익률": st.column_config.TextColumn("수익률", disabled=True), "매수가": st.column_config.NumberColumn(format="$%.2f"), "목표가": st.column_config.NumberColumn(format="$%.1f"), "상태": st.column_config.TextColumn(disabled=True)}
-            )
-            if st.button("💾 티어 수정 저장 (GitHub)"):
-                save_cols = ["매수일", "모드", "매수가", "수량", "목표가", "손절기한"]
-                save_csv(edited_h[save_cols], HOLDINGS_FILE)
-                st.session_state['holdings'] = edited_h[save_cols]
-                st.success("저장되었습니다!")
-                st.rerun()
-        else: st.info("현재 보유 중인 티어가 없습니다.")
-        
-        st.markdown("---")
-        
-        st.subheader("📝 매매 수익 기록장 (Cloud 저장)")
-        df_j = st.session_state['journal']
-        df_eq = st.session_state['equity_history']
-        df_log = st.session_state['action_log']
-        init_prin = saved_init_cap
-        
-        if not df_j.empty:
-            total_prof_j = df_j['수익금'].sum()
-            total_yield_j = (total_prof_j / init_prin * 100)
-            mc1, mc2, mc3 = st.columns(3)
-            mc1.metric("🏁 시작 원금", f"${init_prin:,.0f}")
-            mc2.metric("💰 누적 수익금", f"${total_prof_j:,.2f}", delta_color="normal")
-            mc3.metric("📈 총 수익률", f"{total_yield_j:.1f}%", delta_color="normal")
+        # ─── 매수 처리 ───
+        holdings_val = sum(s['shares']*close for s in atk_slots+def_slots if s is not None)
+
+        if mode == '공격':
+            # FI 음수(하락)일 때 다음 빈 티어 채우기
+            buy_cond_pct = p['atk_fi_neg'] if not fi_p else p['atk_buy_pct']
+            buy_trigger  = prev_close * (1 + buy_cond_pct / 100)
+            if close <= buy_trigger:
+                # 비어 있는 첫 티어 찾기
+                for ti in range(atk_tiers):
+                    if atk_slots[ti] is None:
+                        total_val   = cash + holdings_val
+                        alloc       = total_val / atk_tiers
+                        if alloc < 1 or cash < alloc:
+                            alloc = cash
+                        if alloc < 1:
+                            break
+                        shares      = alloc / close
+                        hold_days   = calc_hold_days(rsi, p['atk_hold_nmin'], p['atk_hold_nmax'], p['atk_hold_a'])
+                        sell_pct    = calc_sell_pct(rsi, p['atk_sell_min'], p['atk_sell_max'], p['atk_sell_a'])
+                        sell_target = close * (1 + sell_pct / 100)
+                        hold_until  = i + hold_days   # 인덱스 기준
+                        cash       -= alloc
+                        atk_slots[ti] = {
+                            'buy_price': close, 'sell_target': sell_target,
+                            'hold_until_idx': hold_until, 'shares': shares,
+                            'mode': '공격', 'rsi': rsi, 'hold_days': hold_days,
+                            'sell_pct': sell_pct,
+                        }
+                        log.append({'날짜': date, 'Action': '🟢매수(공)', '티어': f'공T{ti+1}',
+                                    '종가': close, '수량': shares,
+                                    '손익': 0, '사유': f'RSI{rsi:.0f}→{hold_days}일/{sell_pct:.2f}%',
+                                    'Cash': cash, 'Holdings': sum(s['shares']*close for s in atk_slots if s)})
+                        break   # 하루 1티어만
+
+        else:  # 방어모드
+            if not np.isnan(_ma3):
+                cond1 = _ma3 * (1 + p['def_buy_ma'] / 100)
+                cond2 = prev_close * (1 + p['def_buy_prev'] / 100)
+                buy_trigger = min(cond1, cond2)
+                if close <= buy_trigger:
+                    for ti in range(def_tiers):
+                        if def_slots[ti] is None:
+                            total_val = cash + holdings_val
+                            w = def_weights[ti]
+                            alloc = total_val * w
+                            if alloc > cash:
+                                alloc = cash
+                            if alloc < 1:
+                                break
+                            shares     = alloc / close
+                            hold_until = i + p['def_hold']
+                            cash      -= alloc
+                            def_slots[ti] = {
+                                'buy_price': close, 'sell_target': None,
+                                'hold_until_idx': hold_until, 'shares': shares,
+                                'mode': '방어', 'rsi': rsi, 'hold_days': p['def_hold'],
+                            }
+                            log.append({'날짜': date, 'Action': '🟢매수(방)', '티어': f'방T{ti+1}',
+                                        '종가': close, '수량': shares,
+                                        '손익': 0, '사유': f'MA{p["def_ma_period"]} / {p["def_buy_ma"]}%',
+                                        'Cash': cash, 'Holdings': sum(s['shares']*close for s in def_slots if s)})
+                            break   # 하루 1티어만
+
+        # 자산 계산
+        holdings_val = sum(s['shares']*close for s in atk_slots+def_slots if s is not None)
+        total_val = cash + holdings_val
+        total_assets_arr.append({'날짜': date, 'Total_Asset': total_val,
+                                  'Cash': cash, 'Mode': mode})
+
+    # DataFrame 변환
+    asset_df = pd.DataFrame(total_assets_arr).set_index('날짜')
+    log_df   = pd.DataFrame(log) if log else pd.DataFrame()
+    return asset_df, log_df
+
+# ─────────────────────────────────────────────
+# 성과 계산
+# ─────────────────────────────────────────────
+def calc_metrics(asset_df, init_cash):
+    ta    = asset_df['Total_Asset']
+    total_ret   = (ta.iloc[-1] / init_cash - 1) * 100
+    years = (ta.index[-1] - ta.index[0]).days / 365.25
+    cagr  = ((ta.iloc[-1]/init_cash)**(1/years) - 1)*100 if years > 0 else 0
+    peak  = ta.cummax()
+    dd    = (ta - peak) / peak * 100
+    mdd   = dd.min()
+    calmar = cagr / abs(mdd) if mdd != 0 else 0
+
+    # 연도별
+    yearly = {}
+    for yr, grp in asset_df.groupby(asset_df.index.year):
+        start_val = init_cash if yr == asset_df.index.year.min() else \
+                    asset_df[asset_df.index.year < yr]['Total_Asset'].iloc[-1]
+        end_val   = grp['Total_Asset'].iloc[-1]
+        ann_ret   = (end_val / start_val - 1) * 100
+        peak_yr   = grp['Total_Asset'].cummax()
+        mdd_yr    = ((grp['Total_Asset'] - peak_yr) / peak_yr * 100).min()
+        yearly[yr] = {'수익률': ann_ret, 'MDD': mdd_yr, '기말자산': end_val}
+
+    return {
+        'total_ret': total_ret,
+        'cagr': cagr,
+        'mdd': mdd,
+        'calmar': calmar,
+        'final_asset': ta.iloc[-1],
+        'yearly': yearly,
+    }
+
+# ─────────────────────────────────────────────
+# 보유기간/매도조건 미리보기 테이블
+# ─────────────────────────────────────────────
+def preview_table(p):
+    rows = []
+    for rsi in [35, 40, 45, 50, 55, 60, 65, 70]:
+        h = calc_hold_days(rsi, p['atk_hold_nmin'], p['atk_hold_nmax'], p['atk_hold_a'])
+        s = calc_sell_pct(rsi, p['atk_sell_min'], p['atk_sell_max'], p['atk_sell_a'])
+        rows.append({'매수RSI': rsi, '보유일': h, '매도기준(%)': round(s,2)})
+    return pd.DataFrame(rows)
+
+# ─────────────────────────────────────────────
+# UI
+# ─────────────────────────────────────────────
+st.title("🎯 Dual Sniper Pro 백테스트")
+st.caption("공격/방어 2모드 · RSI 정규화 보유기간/매도조건 · 5-티어 독립 운용")
+
+# ── 사이드바 ──
+with st.sidebar:
+    st.header("⚙️ 파라미터")
+
+    with st.expander("📊 데이터 설정", expanded=True):
+        ticker     = st.text_input("티커", DEFAULT['ticker'])
+        col1, col2 = st.columns(2)
+        start_date = col1.date_input("시작일", datetime(2016,1,1))
+        end_date   = col2.date_input("종료일", datetime.today())
+        init_cash  = st.number_input("초기 자금($)", value=DEFAULT['init_cash'], step=1000.0)
+
+    with st.expander("🗂 모드 설정"):
+        mode_src = st.radio("모드 소스", ["자동(wRSI 기반)", "로그 CSV 업로드"])
+        log_file = None
+        if mode_src == "로그 CSV 업로드":
+            log_file = st.file_uploader("Dual Sniper 로그 CSV", type="csv")
         else:
-            st.info("아직 실현된 수익이 없습니다.")
+            col1, col2 = st.columns(2)
+            mode_up = col1.number_input("공격 진입(wRSI↑)", value=DEFAULT['mode_rsi_up'], step=1.0)
+            mode_dn = col2.number_input("방어 진입(wRSI↓)", value=DEFAULT['mode_rsi_dn'], step=1.0)
 
-        st.markdown("")
-        start_date_display = saved_start_date.strftime("%Y-%m-%d")
-        
-        with st.expander(f"📜 전략 시작일({start_date_display}) 이후 상세 매매 기록 보기", expanded=False):
-            if not df_log.empty:
-                st.dataframe(
-                    df_log, 
-                    use_container_width=True,
-                    column_config={
-                        "구분": st.column_config.TextColumn("구분", width="small"),
-                        "비고": st.column_config.TextColumn("비고", width="medium"),
-                    }
-                )
-            else:
-                st.caption("⚠️ 기록된 매매 내역이 없습니다.")
+    with st.expander("⚔️ 공격모드 파라미터"):
+        atk_tiers   = st.number_input("분할수", value=DEFAULT['atk_tiers'], min_value=1, max_value=10)
+        col1, col2  = st.columns(2)
+        atk_buy_pct = col1.number_input("매수조건 FI+(%, 전일종가 대비)", value=DEFAULT['atk_buy_pct'])
+        atk_fi_neg  = col2.number_input("매수조건 FI-(%, 고정)", value=DEFAULT['atk_fi_neg'])
+        st.markdown("**보유기간 정규화**")
+        col1, col2, col3 = st.columns(3)
+        atk_hold_nmin = col1.number_input("n_min(일)", value=DEFAULT['atk_hold_nmin'])
+        atk_hold_nmax = col2.number_input("n_max(일)", value=DEFAULT['atk_hold_nmax'])
+        atk_hold_a    = col3.number_input("α(보유)", value=DEFAULT['atk_hold_a'], step=0.1)
+        st.markdown("**매도조건 정규화**")
+        col1, col2, col3 = st.columns(3)
+        atk_sell_min = col1.number_input("sell_min(%)", value=DEFAULT['atk_sell_min'], step=0.05)
+        atk_sell_max = col2.number_input("sell_max(%)", value=DEFAULT['atk_sell_max'], step=0.1)
+        atk_sell_a   = col3.number_input("α(매도)", value=DEFAULT['atk_sell_a'], step=0.05)
+        atk_ma_period = st.number_input("매도보류 MA 기준", value=DEFAULT['atk_ma_period'])
+        # 미리보기
+        prev_p = dict(atk_hold_nmin=atk_hold_nmin, atk_hold_nmax=atk_hold_nmax,
+                      atk_hold_a=atk_hold_a, atk_sell_min=atk_sell_min,
+                      atk_sell_max=atk_sell_max, atk_sell_a=atk_sell_a)
+        st.dataframe(preview_table(prev_p), hide_index=True, use_container_width=True)
 
-        st.markdown("### 📈 내 자산 성장 그래프 (Equity Curve)")
-        if not df_eq.empty:
-            df_eq['날짜'] = pd.to_datetime(df_eq['날짜'])
-            df_eq = df_eq.sort_values(by="날짜")
-            fig, ax = plt.subplots(figsize=(10, 4))
-            ax.plot(df_eq['날짜'], df_eq['총자산'], color='#4CAF50', linewidth=2)
-            ax.fill_between(df_eq['날짜'], df_eq['총자산'], init_prin, where=(df_eq['총자산'] >= init_prin), color='#4CAF50', alpha=0.1)
-            ax.fill_between(df_eq['날짜'], df_eq['총자산'], init_prin, where=(df_eq['총자산'] < init_prin), color='red', alpha=0.1)
-            ax.axhline(y=init_prin, color='gray', linestyle='--', alpha=0.5, label='원금')
-            ax.set_title("Total Equity Growth", fontweight='bold')
-            ax.grid(True, linestyle='--', alpha=0.3)
-            ax.yaxis.set_major_formatter(mtick.StrMethodFormatter('${x:,.0f}'))
-            st.pyplot(fig)
-        else: st.info("그래프 데이터가 없습니다.")
+    with st.expander("🛡 방어모드 파라미터"):
+        def_tiers   = st.number_input("분할수 ", value=DEFAULT['def_tiers'], min_value=1, max_value=10)
+        def_hold    = st.number_input("보유기간(일)", value=DEFAULT['def_hold'])
+        col1, col2  = st.columns(2)
+        def_buy_ma  = col1.number_input("매수조건 MA(%)", value=DEFAULT['def_buy_ma'])
+        def_buy_prev= col2.number_input("매수조건 전일(%)", value=DEFAULT['def_buy_prev'])
+        col1, col2  = st.columns(2)
+        def_sell_pct= col1.number_input("매도조건 MA(%)", value=DEFAULT['def_sell_pct'])
+        def_ma_period= col2.number_input("MA 기준(일)", value=DEFAULT['def_ma_period'])
+        def_weights_str = st.text_input("티어 비중(%, 쉼표구분)", value="6,13,20,27,34")
 
-    with tab_backtest:
-        st.header("🧪 백테스트 성과분석")
-        if offline_mode:
-            st.warning("오프라인 모드에서는 백테스트를 실행할 수 없습니다.")
+    run_btn = st.button("▶️ 백테스트 실행", type="primary", use_container_width=True)
+
+# ── 탭 레이아웃 ──
+tab_result, tab_log, tab_compare, tab_logic = st.tabs(
+    ["📈 백테스트 결과", "📋 매매 로그", "🔍 로그 비교", "📖 전략 로직"]
+)
+
+# ── 백테스트 실행 ──
+if run_btn:
+    # 파라미터 패킹
+    try:
+        def_w = [int(x.strip()) for x in def_weights_str.split(',')]
+    except:
+        def_w = DEFAULT['def_weights']
+
+    params = dict(
+        init_cash     = float(init_cash),
+        atk_tiers     = int(atk_tiers),
+        atk_buy_pct   = float(atk_buy_pct),
+        atk_fi_neg    = float(atk_fi_neg),
+        atk_hold_nmin = int(atk_hold_nmin),
+        atk_hold_nmax = int(atk_hold_nmax),
+        atk_hold_a    = float(atk_hold_a),
+        atk_sell_min  = float(atk_sell_min),
+        atk_sell_max  = float(atk_sell_max),
+        atk_sell_a    = float(atk_sell_a),
+        atk_ma_period = int(atk_ma_period),
+        def_tiers     = int(def_tiers),
+        def_hold      = int(def_hold),
+        def_buy_ma    = float(def_buy_ma),
+        def_buy_prev  = float(def_buy_prev),
+        def_sell_pct  = float(def_sell_pct),
+        def_ma_period = int(def_ma_period),
+        def_weights   = def_w,
+    )
+
+    with st.spinner("데이터 로드 중..."):
+        if mode_src == "로그 CSV 업로드" and log_file is not None:
+            raw_log = pd.read_csv(log_file)
+            df_data = load_data_from_log(raw_log)
+            # yfinance로 보완 (MA, FI 등 재계산)
+            yf_raw = yf.download(ticker, start=str(start_date), end=str(end_date),
+                                  auto_adjust=True, progress=False)
+            if not yf_raw.empty:
+                yf_df = pd.DataFrame({'Close': yf_raw['Close'].squeeze()}).dropna()
+                yf_df.index = pd.to_datetime(yf_df.index)
+                yf_df['FI_pos'] = (yf_df['Close'] >= yf_df['Close'].shift(1))
+                yf_df['MA3'] = calc_ma(yf_df['Close'], 3)
+                yf_df['MA5'] = calc_ma(yf_df['Close'], 5)
+                yf_df['RSI'] = calc_rsi(yf_df['Close'], DEFAULT['rsi_period'])
+                # 모드는 업로드 로그에서
+                df_data = df_data[['Mode']].join(yf_df, how='inner')
         else:
-            bt_init_cap = st.number_input("백테스트 초기 자본 ($)", value=10000.0, step=1000.0)
-            bc1, bc2 = st.columns(2)
-            start_d = bc1.date_input("검증 시작일", value=datetime(2010, 1, 1), min_value=datetime(2000, 1, 1))
-            end_d = bc2.date_input("검증 종료일", value=today, min_value=datetime(2000, 1, 1))
-            
-            if st.button("🚀 분석 실행"):
-                with st.spinner("분석 중..."):
-                    res, metrics, df_yearly, df_debug = run_backtest_fixed(df, start_d, end_d, bt_init_cap)
-                    if res is not None:
-                        final = res['Equity'].iloc[-1]
-                        ret = (final/bt_init_cap) - 1
-                        days = (res.index[-1] - res.index[0]).days
-                        cagr = (1+ret)**(365/days) - 1 if days > 0 else 0
-                        res['Peak'] = res['Equity'].cummax()
-                        res['Drawdown'] = (res['Equity'] - res['Peak']) / res['Peak']
-                        mdd = res['Drawdown'].min()
-                        calmar = cagr / abs(mdd) if mdd != 0 else 0
-                        
-                        m1, m2, m3, m4, m5, m6 = st.columns(6)
-                        m1.metric("최종 수익금", f"${final:,.0f}", f"{ret*100:,.1f}%")
-                        m2.metric("CAGR", f"{cagr*100:.2f}%")
-                        m3.metric("MDD", f"{mdd*100:.2f}%", delta_color="inverse")
-                        m4.metric("Calmar", f"{calmar:.2f}")
-                        m5.metric("Sortino", f"{metrics['sortino']:.2f}")
-                        m6.metric("Profit Factor", f"{metrics['profit_factor']:.2f}")
-                        
-                        st.markdown("#### 📊 통합 성과 차트")
-                        plt.style.use('default')
-                        fig, ax1 = plt.subplots(figsize=(12, 6))
-                        color = 'tab:blue'
-                        ax1.set_xlabel('Date')
-                        ax1.set_ylabel('Total Equity ($)', color=color, fontweight='bold')
-                        ax1.plot(res.index, res['Equity'], color=color, linewidth=1.5, label='Equity')
-                        ax1.tick_params(axis='y', labelcolor=color)
-                        ax1.yaxis.set_major_formatter(mtick.StrMethodFormatter('${x:,.0f}'))
-                        ax1.grid(True, linestyle='--', alpha=0.3)
-                        ax2 = ax1.twinx()
-                        color = 'tab:red'
-                        ax2.set_ylabel('Drawdown (%)', color=color, fontweight='bold')
-                        ax2.fill_between(res.index, res['Drawdown']*100, 0, color=color, alpha=0.2, label='Drawdown')
-                        ax2.tick_params(axis='y', labelcolor=color)
-                        ax2.set_ylim(-100, 5)
-                        ax2.yaxis.set_major_formatter(mtick.PercentFormatter())
-                        plt.title(f"Portfolio Performance vs Risk", fontweight='bold')
-                        plt.tight_layout()
-                        st.pyplot(fig)
-                        
-                        st.markdown("#### 📅 연도별 성과표")
-                        df_yearly_fmt = df_yearly.copy()
-                        df_yearly_fmt['수익률'] = df_yearly_fmt['수익률'].apply(lambda x: f"{x*100:.1f}%")
-                        df_yearly_fmt['MDD'] = df_yearly_fmt['MDD'].apply(lambda x: f"{x*100:.1f}%")
-                        df_yearly_fmt['기말자산'] = df_yearly_fmt['기말자산'].apply(lambda x: f"${x:,.0f}")
-                        st.dataframe(df_yearly_fmt.T, use_container_width=True)
-                        
-                        st.markdown("#### 🔍 상세 매매 및 지표 로그 (Debug Log)")
-                        st.dataframe(df_debug.sort_index(ascending=False), use_container_width=True)
-                    else: st.error("데이터 부족")
+            df_data = load_data(ticker, str(start_date), str(end_date),
+                                mode_up=mode_up, mode_dn=mode_dn)
 
-    with tab_logic:
-        st.header("📚 동파법(Dongpa) 전략 매뉴얼 (상세)")
-        st.markdown("""
-        ### 1. 전략 개요 (Philosophy)
-        * **핵심:** "시장의 계절(Mode)을 먼저 파악하고, 그에 맞는 옷(Rule)을 입는다."
-        * **대상:** SOXL (3배 레버리지) / **지표:** QQQ (나스닥100)
-        * **특징:** 예측보다는 **대응**에 초점을 맞춘 변동성 돌파 & 추세 추종 하이브리드 전략.
+    if df_data is None or df_data.empty:
+        st.error("데이터를 불러올 수 없습니다. 티커나 날짜를 확인하세요.")
+    else:
+        with st.spinner("백테스트 실행 중..."):
+            asset_df, log_df = run_backtest(df_data, params)
+            metrics = calc_metrics(asset_df, float(init_cash))
 
-        ---
+        st.session_state['asset_df'] = asset_df
+        st.session_state['log_df']   = log_df
+        st.session_state['metrics']  = metrics
+        st.session_state['df_data']  = df_data
+        st.session_state['params']   = params
 
-        ### 2. 시장 모드 판단 (Market Modes)
-        매주 금요일 종가 기준으로 **QQQ 주봉 RSI(14)**를 분석하여 다음 주의 모드를 결정합니다.
+# ── 결과 탭 ──
+with tab_result:
+    if 'metrics' not in st.session_state:
+        st.info("왼쪽 패널에서 파라미터를 설정하고 백테스트를 실행하세요.")
+    else:
+        m  = st.session_state['metrics']
+        ad = st.session_state['asset_df']
+        p  = st.session_state['params']
 
-        | 모드 | 조건 (Condition) | 시장 상황 해석 |
-        | :--- | :--- | :--- |
-        | **🛡️ Safe** | `RSI > 65` & `하락` | 고점 과열 후 꺾임 (조정 임박) |
-        | **🛡️ Safe** | `40 < RSI < 50` & `하락` | 약세장에서의 지속 하락 |
-        | **🛡️ Safe** | `50선 하향 돌파` | 추세가 꺾이는 데드크로스 |
-        | **⚔️ Offense** | `RSI < 35` & `상승` | 과매도권에서의 바닥 반등 |
-        | **⚔️ Offense** | `50 < RSI < 60` & `상승` | 전형적인 상승 추세 |
-        | **⚔️ Offense** | `50선 상향 돌파` | 추세가 살아나는 골든크로스 |
-        
-        * **유지(Hold):** 위 조건에 해당하지 않으면 **직전 주의 모드를 그대로 유지**합니다.
+        # 핵심 지표
+        c1,c2,c3,c4 = st.columns(4)
+        c1.metric("최종 자산",   f"${m['final_asset']:,.0f}")
+        c2.metric("누적 수익률", f"{m['total_ret']:+.1f}%")
+        c3.metric("CAGR",       f"{m['cagr']:+.1f}%")
+        c4.metric("MDD",        f"{m['mdd']:.1f}%")
+        c1b,c2b = st.columns(2)
+        c1b.metric("Calmar",  f"{m['calmar']:.2f}")
+        mode_days = st.session_state['df_data']['Mode'].value_counts()
+        c2b.metric("모드 비율", f"공격 {mode_days.get('공격',0)}일 / 방어 {mode_days.get('방어',0)}일")
 
-        ---
+        # 자산 차트
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7), sharex=True,
+                                        gridspec_kw={'height_ratios':[3,1]})
+        ax1.plot(ad.index, ad['Total_Asset'], color='#1a73e8', linewidth=1.5, label='총 자산')
+        ax1.set_ylabel("자산 ($)")
+        ax1.yaxis.set_major_formatter(mtick.FuncFormatter(lambda x,_: f'${x:,.0f}'))
+        ax1.set_title(f"Dual Sniper Pro 백테스트 — {ticker}")
+        ax1.legend()
+        ax1.grid(alpha=0.3)
 
-        ### 3. 실전 매매 규칙 (Action Rules)
-        **중요:** 매수 체결 당시의 모드 규칙을 매도 시까지 유지합니다 (Sticky Rule).
+        # 모드 배경색
+        dfd = st.session_state['df_data']
+        dates = ad.index
+        prev_mode = None; start_i = None
+        for j, (dt, row) in enumerate(dfd.reindex(dates).iterrows()):
+            cur_mode = row.get('Mode','방어')
+            if cur_mode != prev_mode:
+                if prev_mode is not None and start_i is not None:
+                    color = 'rgba(255,100,100,0.08)' if prev_mode == '방어' else 'rgba(100,180,255,0.08)'
+                    color = '#ffdddd' if prev_mode == '방어' else '#ddeeff'
+                    ax1.axvspan(dates[start_i], dt, alpha=0.15,
+                                color='red' if prev_mode=='방어' else 'blue')
+                start_i = j
+                prev_mode = cur_mode
 
-        | 구분 | 🛡️ 방어 (Safe) | ⚔️ 공세 (Offense) |
-        | :--- | :--- | :--- |
-        | **매수 타점** | 전일 종가 대비 **-3.0%** | 전일 종가 대비 **-5.0%** |
-        | **익절 목표** | 매수가 대비 **+0.5%** | 매수가 대비 **+3.0%** |
-        | **손절 기한** | **35 거래일** | **7 거래일** |
-        
-        #### 🛒 주문 방식 (Order Types)
-        * **매수:** **LOC (Limit On Close)** - 장 마감 종가가 타점 이하일 때만 체결.
-        * **익절 매도:** **LOC (Limit On Close)** - 장 마감 종가가 목표가 이상일 때만 체결 (장중 휩소 방지).
-        * **기간 만료 매도:** **MOC (Market On Close)** - 손절 기한 도래 시 장 마감 시장가로 무조건 청산.
+        # 드로다운
+        peak = ad['Total_Asset'].cummax()
+        dd   = (ad['Total_Asset'] - peak) / peak * 100
+        ax2.fill_between(ad.index, dd, 0, alpha=0.5, color='#d93025', label='Drawdown')
+        ax2.set_ylabel("DD (%)")
+        ax2.grid(alpha=0.3)
+        ax2.legend()
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close()
 
-        ---
+        # 연도별 성과표
+        st.subheader("📅 연도별 성과")
+        yearly_rows = []
+        for yr, yd in sorted(m['yearly'].items()):
+            yearly_rows.append({
+                '연도': yr,
+                '수익률': f"{yd['수익률']:+.1f}%",
+                'MDD': f"{yd['MDD']:.1f}%",
+                '기말 자산': f"${yd['기말자산']:,.0f}",
+            })
+        st.dataframe(pd.DataFrame(yearly_rows), hide_index=True, use_container_width=True)
 
-        ### 4. 자금 관리 (Money Management)
-        * **7분할:** 총 자금을 7개 슬롯으로 분할 투입하여 리스크를 분산합니다.
-        * **10일 리셋:** 2주(10거래일)마다 총 자산 기준으로 슬롯 크기를 재산정하여 복리 효과를 극대화합니다.
-        """)
+# ── 매매 로그 탭 ──
+with tab_log:
+    if 'log_df' not in st.session_state or st.session_state['log_df'].empty:
+        st.info("백테스트 실행 후 로그가 표시됩니다.")
+    else:
+        log = st.session_state['log_df'].copy()
+        log['날짜'] = pd.to_datetime(log['날짜']).dt.strftime('%Y-%m-%d')
+        log['종가'] = log['종가'].apply(lambda x: f"${x:.2f}")
+        log['수량'] = log['수량'].apply(lambda x: f"{x:.1f}")
+        log['손익'] = log['손익'].apply(lambda x: f"${x:+,.0f}")
+        log['잔여현금'] = log['Cash'].apply(lambda x: f"${x:,.0f}")
 
-if __name__ == "__main__":
-    main()
+        # 필터
+        col1, col2 = st.columns(2)
+        filter_action = col1.multiselect("Action 필터",
+            options=log['Action'].unique().tolist(), default=log['Action'].unique().tolist())
+        filter_tier = col2.multiselect("티어 필터",
+            options=log['티어'].unique().tolist(), default=log['티어'].unique().tolist())
+
+        filtered = log[log['Action'].isin(filter_action) & log['티어'].isin(filter_tier)]
+        st.dataframe(filtered[['날짜','Action','티어','종가','수량','손익','사유','잔여현금']],
+                     hide_index=True, use_container_width=True)
+        buf = io.BytesIO()
+        filtered.to_csv(buf, index=False, encoding='utf-8-sig')
+        st.download_button("📥 CSV 다운로드", buf.getvalue(),
+                           file_name="dual_sniper_log.csv", mime="text/csv")
+
+# ── 로그 비교 탭 ──
+with tab_compare:
+    st.subheader("📊 원본 로그 vs 백테스트 비교")
+    st.info("Dual Sniper 원본 로그 CSV를 업로드하면 연도별 수익률을 비교합니다.")
+    orig_file = st.file_uploader("원본 로그 CSV", type="csv", key="compare_upload")
+    if orig_file is not None and 'metrics' in st.session_state:
+        orig = pd.read_csv(orig_file)
+        orig = orig[orig['날짜'].str.match(r'\d{2}-\d{2}-\d{2}', na=False)].copy()
+        orig['날짜'] = pd.to_datetime('20' + orig['날짜'].str.split(' ').str[0])
+        orig['Total_Asset'] = orig['총자산'].str.replace('[$,]','',regex=True).astype(float)
+        orig['year'] = orig['날짜'].dt.year
+        orig_yearly = orig.groupby('year')['Total_Asset'].last()
+
+        my_m = st.session_state['metrics']['yearly']
+        rows = []
+        for yr in sorted(set(orig['year'].unique()) | set(my_m.keys())):
+            o_a = orig_yearly.get(yr, None)
+            m_a = my_m.get(yr, {}).get('기말자산', None)
+            init = float(st.session_state['params']['init_cash'])
+            o_r  = (o_a / init - 1) * 100 if o_a and yr == min(orig['year']) else None
+            rows.append({'연도': yr,
+                         '원본 기말자산': f"${o_a:,.0f}" if o_a else '-',
+                         '백테스트 기말자산': f"${m_a:,.0f}" if m_a else '-'})
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+# ── 전략 로직 탭 ──
+with tab_logic:
+    st.markdown("""
+## 🎯 Dual Sniper Pro 전략 로직
+
+### 1. 모드 전환
+| 항목 | 내용 |
+|------|------|
+| **공격모드 진입** | 주봉 RSI(wRSI) ≥ 기준값 상향 돌파 |
+| **방어모드 진입** | 주봉 RSI(wRSI) < 기준값 하향 돌파 |
+| **전환 기준** | 주간 캔들 확정 시점 |
+
+---
+
+### 2. 공격모드 로직
+
+#### 매수
+| 조건 | 내용 |
+|------|------|
+| **FI 음수(-)** | 전일 종가 × (1 + -0.1%) LOC 매수 |
+| **FI 양수(+)** | 전일 종가 × (1 + 입력%) LOC 매수 |
+| **티어 운용** | 하루 1티어씩, 비어 있는 첫 티어 채움 |
+| **할당금** | 총자산 / 분할수 |
+
+#### 보유기간 정규화
+```
+n = n_min + (n_max - n_min) × (1−x)^(1/α)
+x = clamp((매수RSI − 35) / 30, 0, 1)
+```
+→ RSI 낮을수록(과매도) 더 오래 보유
+
+#### 매도조건 정규화
+```
+sell% = sell_min + (sell_max − sell_min) × (1−x)^(1/α)
+```
+→ RSI 낮을수록 더 높은 수익률 목표 (회복 기다림)
+
+#### 매도 보류 조건
+전일 종가 > 전일 MA(5) 이면 T1 매도 보류 (MOC 제외)
+
+---
+
+### 3. 방어모드 로직
+
+#### 매수
+| 조건 | 내용 |
+|------|------|
+| **매수기준가** | min(MA(3)×(1+cond1%), 전일종가×(1+cond2%)) |
+| **티어 비중** | 6 / 13 / 20 / 27 / 34% (오름 등차수열) |
+| **보유기간** | 8일 고정 (calendar day) |
+
+#### 매도
+| 조건 | 내용 |
+|------|------|
+| **MA 매도** | `factor×(C[-1]+C[-2])/(n−factor)` ≥ 오늘 종가 |
+| **MOC 청산** | 보유기간 만료 시 무조건 청산 |
+
+---
+
+### 4. 공통 규칙
+- MOC 매도가 존재하는 날은 다른 매도 주문 없음
+- 각 티어는 독립적으로 운용 (공격 5개, 방어 5개 슬롯)
+- 공격/방어 포지션 풀은 별도 관리
+""")
