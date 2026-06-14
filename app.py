@@ -106,31 +106,6 @@ def load_data(ticker, start, end, rsi_period=14, mode_up=55, mode_dn=50):
 
     return df
 
-def load_data_from_log(log_df):
-    """업로드된 Dual Sniper 로그에서 모드/가격 시리즈 추출"""
-    log = log_df.copy()
-    log = log[~log['날짜'].isna()].copy()
-    log = log[log['날짜'].str.match(r'\d{2}-\d{2}-\d{2}', na=False)].copy()
-    log['날짜'] = '20' + log['날짜'].str.split(' ').str[0]
-    log['날짜'] = pd.to_datetime(log['날짜'], format='%Y-%m-%d', errors='coerce')
-    log = log.dropna(subset=['날짜']).set_index('날짜')
-
-    close_s = log['종가'].str.replace('$','',regex=False).astype(float)
-    mode_s  = log['모드']
-    rsi_s   = pd.to_numeric(log['일RSI'], errors='coerce')
-    fi_pos_s = (log['FI'] == '=+')   # True=양수 FI
-    ma3_s   = pd.to_numeric(log['MA(n)'], errors='coerce')
-    ma5_s   = pd.to_numeric(log['MA(5)'], errors='coerce')
-
-    out = pd.DataFrame({
-        'Close':   close_s,
-        'RSI':     rsi_s,
-        'FI_pos':  fi_pos_s,
-        'MA3':     ma3_s,
-        'MA5':     ma5_s,
-        'Mode':    mode_s,
-    })
-    return out.dropna(subset=['Close'])
 
 # ─────────────────────────────────────────────
 # 정규화 공식
@@ -408,14 +383,12 @@ with st.sidebar:
         init_cash  = st.number_input("초기 자금($)", value=DEFAULT['init_cash'], step=1000.0)
 
     with st.expander("🗂 모드 설정"):
-        mode_src = st.radio("모드 소스", ["자동(wRSI 기반)", "로그 CSV 업로드"])
-        log_file = None
-        if mode_src == "로그 CSV 업로드":
-            log_file = st.file_uploader("Dual Sniper 로그 CSV", type="csv")
-        else:
-            col1, col2 = st.columns(2)
-            mode_up = col1.number_input("공격 진입(wRSI↑)", value=DEFAULT['mode_rsi_up'], step=1.0)
-            mode_dn = col2.number_input("방어 진입(wRSI↓)", value=DEFAULT['mode_rsi_dn'], step=1.0)
+        st.caption("주봉 RSI(wRSI) 기반 자동 모드 전환")
+        col1, col2 = st.columns(2)
+        mode_up = col1.number_input("공격 진입(wRSI↑)", value=DEFAULT['mode_rsi_up'], step=1.0,
+                                    help="wRSI가 이 값 이상 올라오면 공격모드 전환")
+        mode_dn = col2.number_input("방어 진입(wRSI↓)", value=DEFAULT['mode_rsi_dn'], step=1.0,
+                                    help="wRSI가 이 값 아래로 내려가면 방어모드 전환")
 
     with st.expander("⚔️ 공격모드 파라미터"):
         atk_tiers   = st.number_input("분할수", value=DEFAULT['atk_tiers'], min_value=1, max_value=10)
@@ -486,25 +459,9 @@ if run_btn:
         def_weights   = def_w,
     )
 
-    with st.spinner("데이터 로드 중..."):
-        if mode_src == "로그 CSV 업로드" and log_file is not None:
-            raw_log = pd.read_csv(log_file)
-            df_data = load_data_from_log(raw_log)
-            # yfinance로 보완 (MA, FI 등 재계산)
-            yf_raw = yf.download(ticker, start=str(start_date), end=str(end_date),
-                                  auto_adjust=True, progress=False)
-            if not yf_raw.empty:
-                yf_df = pd.DataFrame({'Close': yf_raw['Close'].squeeze()}).dropna()
-                yf_df.index = pd.to_datetime(yf_df.index)
-                yf_df['FI_pos'] = (yf_df['Close'] >= yf_df['Close'].shift(1))
-                yf_df['MA3'] = calc_ma(yf_df['Close'], 3)
-                yf_df['MA5'] = calc_ma(yf_df['Close'], 5)
-                yf_df['RSI'] = calc_rsi(yf_df['Close'], DEFAULT['rsi_period'])
-                # 모드는 업로드 로그에서
-                df_data = df_data[['Mode']].join(yf_df, how='inner')
-        else:
-            df_data = load_data(ticker, str(start_date), str(end_date),
-                                mode_up=mode_up, mode_dn=mode_dn)
+    with st.spinner("yfinance 데이터 로드 중..."):
+        df_data = load_data(ticker, str(start_date), str(end_date),
+                            mode_up=float(mode_up), mode_dn=float(mode_dn))
 
     if df_data is None or df_data.empty:
         st.error("데이터를 불러올 수 없습니다. 티커나 날짜를 확인하세요.")
@@ -549,20 +506,26 @@ with tab_result:
         ax1.legend()
         ax1.grid(alpha=0.3)
 
-        # 모드 배경색
-        dfd = st.session_state['df_data']
-        dates = ad.index
-        prev_mode = None; start_i = None
-        for j, (dt, row) in enumerate(dfd.reindex(dates).iterrows()):
-            cur_mode = row.get('Mode','방어')
-            if cur_mode != prev_mode:
-                if prev_mode is not None and start_i is not None:
-                    color = 'rgba(255,100,100,0.08)' if prev_mode == '방어' else 'rgba(100,180,255,0.08)'
-                    color = '#ffdddd' if prev_mode == '방어' else '#ddeeff'
-                    ax1.axvspan(dates[start_i], dt, alpha=0.15,
-                                color='red' if prev_mode=='방어' else 'blue')
-                start_i = j
-                prev_mode = cur_mode
+        # 모드 배경색 (공격=파랑, 방어=빨강)
+        dfd  = st.session_state['df_data']
+        mode_series = dfd.reindex(ad.index)['Mode'].fillna('방어')
+        in_block = False; block_start = None; block_mode = None
+        for dt, m_val in mode_series.items():
+            if not in_block:
+                in_block = True; block_start = dt; block_mode = m_val
+            elif m_val != block_mode:
+                ax1.axvspan(block_start, dt, alpha=0.12,
+                            color='steelblue' if block_mode=='공격' else 'tomato')
+                block_start = dt; block_mode = m_val
+        if in_block:
+            ax1.axvspan(block_start, ad.index[-1], alpha=0.12,
+                        color='steelblue' if block_mode=='공격' else 'tomato')
+        from matplotlib.patches import Patch
+        ax1.legend(handles=[
+            ax1.lines[0],
+            Patch(color='steelblue', alpha=0.4, label='공격모드'),
+            Patch(color='tomato',    alpha=0.4, label='방어모드'),
+        ], labels=['총 자산','공격모드','방어모드'])
 
         # 드로다운
         peak = ad['Total_Asset'].cummax()
@@ -617,27 +580,69 @@ with tab_log:
 # ── 로그 비교 탭 ──
 with tab_compare:
     st.subheader("📊 원본 로그 vs 백테스트 비교")
-    st.info("Dual Sniper 원본 로그 CSV를 업로드하면 연도별 수익률을 비교합니다.")
+    st.info("Dual Sniper 원본 로그 CSV를 업로드하면 연도별 자산·수익률을 비교합니다.")
     orig_file = st.file_uploader("원본 로그 CSV", type="csv", key="compare_upload")
-    if orig_file is not None and 'metrics' in st.session_state:
+    if orig_file is not None:
+        import re as _re
         orig = pd.read_csv(orig_file)
-        orig = orig[orig['날짜'].str.match(r'\d{2}-\d{2}-\d{2}', na=False)].copy()
+        orig = orig[orig['날짜'].astype(str).str.match(r'\d{2}-\d{2}-\d{2}', na=False)].copy()
         orig['날짜'] = pd.to_datetime('20' + orig['날짜'].str.split(' ').str[0])
-        orig['Total_Asset'] = orig['총자산'].str.replace('[$,]','',regex=True).astype(float)
+        orig['Total_Asset'] = orig['총자산'].apply(
+            lambda x: float(_re.sub(r'[$,]','',str(x))) if pd.notna(x) else np.nan)
         orig['year'] = orig['날짜'].dt.year
         orig_yearly = orig.groupby('year')['Total_Asset'].last()
 
-        my_m = st.session_state['metrics']['yearly']
-        rows = []
-        for yr in sorted(set(orig['year'].unique()) | set(my_m.keys())):
-            o_a = orig_yearly.get(yr, None)
-            m_a = my_m.get(yr, {}).get('기말자산', None)
+        # 원본 연도별 수익률 계산
+        def yearly_ret(asset_series):
+            rets = {}
+            prev = None
+            for yr in sorted(asset_series.index):
+                cur = asset_series[yr]
+                if prev is None:
+                    rets[yr] = None
+                else:
+                    rets[yr] = (cur / prev - 1) * 100
+                prev = cur
+            return rets
+        orig_ret = yearly_ret(orig_yearly)
+
+        if 'metrics' in st.session_state:
+            my_m = st.session_state['metrics']['yearly']
             init = float(st.session_state['params']['init_cash'])
-            o_r  = (o_a / init - 1) * 100 if o_a and yr == min(orig['year']) else None
-            rows.append({'연도': yr,
-                         '원본 기말자산': f"${o_a:,.0f}" if o_a else '-',
-                         '백테스트 기말자산': f"${m_a:,.0f}" if m_a else '-'})
-        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+            rows = []
+            all_years = sorted(set(orig_yearly.index) | set(my_m.keys()))
+            for yr in all_years:
+                o_a = orig_yearly.get(yr)
+                m_a = my_m.get(yr, {}).get('기말자산')
+                o_r = orig_ret.get(yr)
+                m_r = my_m.get(yr, {}).get('수익률')
+                diff = (m_r - o_r) if (m_r is not None and o_r is not None) else None
+                rows.append({
+                    '연도': yr,
+                    '원본 기말자산':    f"${o_a:,.0f}"   if o_a   else '-',
+                    '백테스트 기말자산': f"${m_a:,.0f}"  if m_a   else '-',
+                    '원본 수익률':      f"{o_r:+.1f}%"   if o_r is not None else '-',
+                    '백테스트 수익률':  f"{m_r:+.1f}%"   if m_r is not None else '-',
+                    '차이':            f"{diff:+.1f}%p"  if diff is not None else '-',
+                })
+            cmp_df = pd.DataFrame(rows)
+            st.dataframe(cmp_df, hide_index=True, use_container_width=True)
+
+            # 자산 비교 차트
+            fig2, ax = plt.subplots(figsize=(12,4))
+            ax.plot(sorted(orig_yearly.index),
+                    [orig_yearly[y] for y in sorted(orig_yearly.index)],
+                    marker='o', label='원본', color='#e8710a')
+            ax.plot(sorted(my_m.keys()),
+                    [my_m[y]['기말자산'] for y in sorted(my_m.keys())],
+                    marker='s', label='백테스트', color='#1a73e8', linestyle='--')
+            ax.set_title("연도별 기말 자산 비교")
+            ax.yaxis.set_major_formatter(mtick.FuncFormatter(lambda x,_: f'${x:,.0f}'))
+            ax.legend(); ax.grid(alpha=0.3)
+            plt.tight_layout()
+            st.pyplot(fig2); plt.close()
+        else:
+            st.warning("먼저 백테스트를 실행하세요.")
 
 # ── 전략 로직 탭 ──
 with tab_logic:
